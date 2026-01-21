@@ -1,0 +1,10 @@
+ros2 launch turtlebot4_gz_bringup turtlebot4_gz.launch.py world:=maze //To start up simulation environment
+
+sudo nano /etc/turtlebot4/setup.bash //To open the setting file that changes the target between simulation and physical robot
+echo $RMW_IMPLEMENTATION //To check whether the target is in simulation or physical orbot
+
+source ~/.bashrc //Must use every time after build
+
+colon build //Bulild everything, must run it under the target folder
+colcon build --packages-select mie443_contest1 //Build select package only (may be faster)
+
