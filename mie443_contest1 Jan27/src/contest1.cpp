@@ -51,7 +51,7 @@ public:
     Contest1Node()
         : Node("contest1_node")
     {
-        // 1. Initialize Publishers & Subscribers
+        // 1. Initialize Publishers & Subscribers for velocity commands
         vel_pub_ = this->create_publisher<geometry_msgs::msg::TwistStamped>("/cmd_vel", 10);
 
         laser_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
@@ -70,7 +70,7 @@ public:
             "/map", rclcpp::QoS(1).transient_local(),
             std::bind(&Contest1Node::mapCallback, this, std::placeholders::_1));
 
-        // 2. TF Listener
+        // 2. TF Listener 
         tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
@@ -82,7 +82,7 @@ public:
             RCLCPP_INFO(this->get_logger(), "Requesting odometry reset...");
         }
 
-        // 4. Timer
+        // 4. Timer for control loop
         timer_ = this->create_timer(
             10ms, std::bind(&Contest1Node::controlLoop, this));
 
@@ -138,7 +138,7 @@ private:
 
     void controlLoop()
     {
-        // 1. Get Robot Pose
+        // 1. Get Robot current location
         try {
             geometry_msgs::msg::TransformStamped t = tf_buffer_->lookupTransform(
                 "map", "base_link", tf2::TimePointZero);
@@ -151,7 +151,7 @@ private:
             yaw_ = raw_odom_yaw_;
         }
 
-        // 2. Time Check
+        // 2. Time Check to shutdown if it exceeds the contest limit 
         if ((this->now() - start_time_).seconds() >= 480.0) {
             stopRobot();
             rclcpp::shutdown();
@@ -169,7 +169,7 @@ private:
             WorldPoint hazard_pt;
             hazard_pt.x = pos_x_ + hazard_dist * std::cos(yaw_);
             hazard_pt.y = pos_y_ + hazard_dist * std::sin(yaw_);
-            virtual_obstacles_.push_back(hazard_pt); 
+            virtual_obstacles_.push_back(hazard_pt);  //Record the location of the bump, store it as virtual obstacle so that it will not go there any more 
             
             bump_timer_ = this->now();
             path_.clear(); 
@@ -181,7 +181,7 @@ private:
 
         // --- BACKUP LOGIC (Short Blind Backup) ---
         if ((this->now() - bump_timer_).seconds() < 1.5) {
-            publishVelocity(-0.15, 0.0);
+            publishVelocity(-0.15, 0.0); //Backup in the opposite direction for 1.5 seconds
             return;
         }
         // ----------------------------------------
@@ -199,7 +199,7 @@ private:
             double dist_to_goal = std::hypot(goal.x - pos_x_, goal.y - pos_y_);
             
             // Goal Logic
-            if (dist_to_goal < 0.10) { 
+            if (dist_to_goal < 0.10) { //A buffer here to make sure that the robot robot doesn't have to accurately aim for the exact destination coordinate
                 
                 if (!scanning_in_progress_) {
                     scanning_in_progress_ = true;
@@ -208,7 +208,7 @@ private:
                 }
 
                 if ((this->now() - scan_timer_).seconds() < 2.0) {
-                    // UPDATED: Stand STILL (0,0) while LIDAR scans
+                    // UPDATED: Stand STILL (0,0) while LIDAR scans, to get completed date 
                     publishVelocity(0.0, 0.0);
                     return; 
                 } else {
@@ -224,7 +224,7 @@ private:
         } 
         else {
             if (!is_planning_) {
-                planToFrontier();
+                planToFrontier(); //Plan to the next frontier
             }
         }
     }
@@ -255,21 +255,21 @@ private:
         // A. Find Frontiers
         std::vector<Point> frontiers = findFrontiers(map_copy);
         if (frontiers.empty()) {
-            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "No frontiers found. Rotating.");
+            RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000, "No frontiers found. Rotating."); //Marks the full exploration of the map 
             publishVelocity(0.0, 0.3); 
             is_planning_ = false;
             return;
         }
 
         // B. Cluster
-        std::vector<std::vector<Point>> groups = clusterFrontiers(frontiers);
+        std::vector<std::vector<Point>> groups = clusterFrontiers(frontiers); //group the frontiers into several chunks of clusters
         
         // C. Find Path
-        Point robot_grid = worldToGrid(pos_x_, pos_y_, map_copy);
+        Point robot_grid = worldToGrid(pos_x_, pos_y_, map_copy); 
         bool found_path = false;
 
         std::sort(groups.begin(), groups.end(), [](const std::vector<Point>& a, const std::vector<Point>& b) {
-            return a.size() > b.size();
+            return a.size() > b.size(); //Select the largest cluster
         });
 
         int checks = 0;
@@ -279,13 +279,13 @@ private:
 
             Point centroid = getValidCentroid(group, map_copy);
             
-            // Distance Filter
+            // Distance Filter: To filter out the centroid that is too close to the robot. This helps prevent the robot from roaming in the same region
             double dist_sq = std::pow(centroid.x - robot_grid.x, 2) + std::pow(centroid.y - robot_grid.y, 2);
             double min_dist_px = 0.25 / map_copy.info.resolution;
             
             if (dist_sq < min_dist_px * min_dist_px) continue;
 
-            // Run A*
+            // Run A* for path planning
             std::vector<WorldPoint> new_path = runAStar(map_copy, robot_grid, centroid);
             if (!new_path.empty()) {
                 path_ = new_path;
@@ -294,7 +294,7 @@ private:
             }
         }
 
-        if (!found_path) {
+        if (!found_path) { //The path is to dangerous to reach. For example, the channel is too narrow
             RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 2000, "Frontiers visible but unreachable.");
             publishVelocity(0.0, 0.3); 
         }
@@ -306,8 +306,8 @@ private:
 
     double getProximityPenalty(Point p, const nav_msgs::msg::OccupancyGrid& map) {
         
-        double hard_radius = 3.0; // 15cm
-        double soft_radius = 10.0; // 50cm
+        double hard_radius = 3.0; // 3 pixels = 15cm
+        double soft_radius = 10.0; // 10 pixels = 50cm.
         
         double min_dist = 100.0;
         int width = map.info.width;
@@ -324,7 +324,6 @@ private:
                 
                 int idx = ny * width + nx;
                 
-                // Only fear REAL obstacles (>50)
                 if (map.data[idx] > 50) {
                     double dist = std::hypot(dx, dy);
                     if (dist < min_dist) min_dist = dist;
