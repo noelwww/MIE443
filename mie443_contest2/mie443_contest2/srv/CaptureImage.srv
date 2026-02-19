@@ -1,0 +1,9 @@
+# Service to capture a single image from the robot's camera
+# This avoids continuous streaming and saves bandwidth
+
+# Request (empty - just trigger the capture)
+---
+# Response
+sensor_msgs/CompressedImage image  # Compressed JPEG image
+bool success                        # Whether capture was successful
+string message                      # Status message or error description

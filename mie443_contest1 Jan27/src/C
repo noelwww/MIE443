@@ -1,0 +1,35 @@
+while (true) { //Infinite loop indicating the music will iterate forever
+    int i = 0;  //Initiate counter: LDAB #$00
+    while (i < 152) { //break at counter 152: CMPA   #152
+        int current_tone   = tone[i];  // LDAA B,X
+        int current_scale  = inner_freq[i];     // Load inner_freq
+        int note_duration  = length[i];  //LDAA    B, Y
+
+        int note_repeats    = speed;   // declear tone speed
+        int silence_repeats = speed_b; // declear silence speed
+
+        if (current_tone == 0) { //Go to blankdelay if tone[i] = 0
+            SetSpeaker(LOW); //External function to silence the speaker
+             for (c = 0; c < silence_repeats; c++){
+                   int counter_duration = note_duration;
+                    while (duration_counter > 0) { //Inner loop to actually delay the tone by a period of time in each count
+                         Delay(255); // Actual delay in time 
+                          duration_counter--; //Decrement the single duration counter
+                }
+            }
+        }
+        else { //Play the sound
+            for (t = 0; t < note_repeats; t++){ //Toneloop
+                int duration_counter = note_duration;
+                while (duration_counter > 0) { //Create the tone at specific pitch
+                    SetSpeaker(LOW); //Create PWM cycle OFF
+                    Delay(current_tone * current_scale);  //Keep the signal for a period of time
+                    SetOutput(HIGH); //Create PWM cycle ON
+                    Delay(current_tone * current_scale); // Keep the signal
+                    duration_counter--;
+                }
+            }
+        }
+        i++;  //Move to next Tone / Silence
+    }
+}
