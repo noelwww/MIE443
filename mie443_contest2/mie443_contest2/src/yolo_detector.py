@@ -52,7 +52,39 @@ class YoloDetectorNode(Node):
         boxes = results[0].boxes
 
         ### YOUR CODE HERE ###
-  
+        best_conf = 0.0
+        best_class_id = -1
+        best_class_name = ""
+        best_box = None
+
+        for box in boxes:
+            conf = float(box.conf[0])
+            if conf > self.confidence_threshold and conf > best_conf:
+                best_conf = conf
+                best_class_id = int(box.cls[0])
+                best_class_name = self.model.names[best_class_id]
+                best_box = box
+
+        if best_box is not None:
+            response.success = True
+            response.class_id = best_class_id
+            response.class_name = best_class_name
+            response.confidence = best_conf
+            response.message = "Detection successful"
+
+            if request.save_detected_image:
+                # Draw bounding box
+                x1, y1, x2, y2 = map(int, best_box.xyxy[0])
+                cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                label = f"{best_class_name} {best_conf:.2f}"
+                cv2.putText(image, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                cv2.imwrite("detected_object.jpg", image)
+        else:
+            response.success = False
+            response.class_id = -1
+            response.class_name = ""
+            response.confidence = 0.0
+            response.message = "No object detected above threshold"
 
         return response
 
