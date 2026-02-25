@@ -1,0 +1,15 @@
+# DetectObject.srv - YOLO object detection service
+# Takes a compressed image and returns detected object info
+
+# Request
+sensor_msgs/CompressedImage image
+bool save_detected_image    # Whether to save the detected image to disk
+
+---
+
+# Response
+int32 class_id        # COCO class ID (-1 if no detection)
+string class_name     # Class name (e.g., "apple", "bottle")
+float32 confidence    # Detection confidence (0.0 to 1.0)
+bool success          # True if detection successful
+string message        # Status message or error description

@@ -1,0 +1,38 @@
+<?xml version="1.0"?>
+<opencv_storage>
+	<coordinate1>
+	<!-- waterbottle -->
+	0.477 <!--x  -->
+	-1.04 <!--y  -->
+	-3.091882 <!--phi-->
+	</coordinate1>
+
+	<coordinate2>
+	<!-- plant -->
+	-0.975 <!--x  -->
+	1.26 <!--y  -->
+	-2.52693 <!--phi-->
+	</coordinate2>
+
+	<coordinate3>
+	<!-- motorcycle -->
+	-3.82 <!--x  -->
+	-0.355 <!--y  -->
+	0.682317 <!--phi-->
+	</coordinate3>
+
+	<coordinate4>
+	<!-- piggybank -->
+	-2.02 <!--x  -->
+	-3.44 <!--y  -->
+	-2.582993 <!--phi-->
+	</coordinate4>
+
+	<coordinate5>
+	<!-- coffee_cup -->
+	-0.0608 <!--x  -->
+	-2.33 <!--y  -->
+	3.141593 <!--phi-->
+	</coordinate5>
+
+</opencv_storage>
