@@ -7,77 +7,175 @@
 #include <rclcpp/rclcpp.hpp>
 #include <ament_index_cpp/get_package_share_directory.hpp>
 #include <chrono>
-#include <thread>
 #include <fstream>
-#include <sstream>
 #include <cmath>
 #include <limits>
+#include <iostream>
+
+// =============================================================================
+// CONTEST CONFIGURATION PARAMETERS
+// Adjust these values during physical testing on the real robot.
+// =============================================================================
+namespace Config {
+    // --- Arm Poses (x, y, z, roll, pitch, yaw) ---
+    // Pose to look at the object on the top plate before picking it up
+    const float ARM_LOOK_X = 0.15;
+    const float ARM_LOOK_Y = 0.0;
+    const float ARM_LOOK_Z = 0.25;
+    const float ARM_LOOK_ROLL = 0.0;
+    const float ARM_LOOK_PITCH = 1.0; // Angled down slightly to view the plate
+    const float ARM_LOOK_YAW = 0.0;
+
+    // Pose to pick up the manipulable object from the top plate
+    const float ARM_PICKUP_X = 0.2;
+    const float ARM_PICKUP_Y = 0.0;
+    const float ARM_PICKUP_Z = 0.2;
+    const float ARM_PICKUP_ROLL = 0.0;
+    const float ARM_PICKUP_PITCH = 1.57;
+    const float ARM_PICKUP_YAW = 0.0;
+    
+    // Pose to carry the object while navigating
+    const float ARM_CARRY_X = 0.1;
+    const float ARM_CARRY_Y = 0.0;
+    const float ARM_CARRY_Z = 0.3;
+    const float ARM_CARRY_ROLL = 0.0;
+    const float ARM_CARRY_PITCH = 0.0;
+    const float ARM_CARRY_YAW = 0.0;
+    
+    // Pose to drop the object into the bin
+    const float ARM_DROP_X = 0.3;
+    const float ARM_DROP_Y = 0.0;
+    const float ARM_DROP_Z = 0.1;
+    const float ARM_DROP_ROLL = 0.0;
+    const float ARM_DROP_PITCH = 1.57;
+    const float ARM_DROP_YAW = 0.0;
+
+    // --- Alignment Parameters ---
+    // Desired distance from the AprilTag to safely drop the object (in meters)
+    const float DESIRED_DROP_DISTANCE = 0.4;
+    
+    // Tolerance for distance alignment (in meters)
+    const float DISTANCE_TOLERANCE = 0.05;
+    
+    // Tolerance for angle alignment (in radians)
+    const float ANGLE_TOLERANCE = 0.1;
+
+    // --- Search Spin Parameters ---
+    // Number of steps for a full 360-degree spin
+    const int SPIN_STEPS = 8;
+    
+    // Angle increment per spin step (in radians)
+    const float SPIN_INCREMENT = M_PI / 4.0;
+}
+// =============================================================================
 
 void runDebugMode(std::shared_ptr<rclcpp::Node> node) {
     RCLCPP_INFO(node->get_logger(), "=== ENTERING DEBUG MODE ===");
     
-    // Initialize arm controller
+    // Initialize controllers
     ArmController armController(node);
-
-    RCLCPP_INFO(node->get_logger(), "=== TESTING ARM CONTROL ===");
-    RCLCPP_INFO(node->get_logger(), "Moving arm to a reachable pose...");
-    
-    // Test arm movement with pose 1
-    bool success = armController.moveToCartesianPose(0.043, 0.199, 0.313,
-                                                     -0.471, -0.557, 0.564, -0.387);
-
-    if(success) {
-        RCLCPP_INFO(node->get_logger(), "Arm moved successfully!");
-        // Test gripper
-        RCLCPP_INFO(node->get_logger(), "Testing gripper...");
-        armController.openGripper();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-        armController.closeGripper();
-        std::this_thread::sleep_for(std::chrono::seconds(2));
-    } else {
-        RCLCPP_ERROR(node->get_logger(), "Arm movement failed - pose may be unreachable");
-    }
-
-    // Test arm movement with pose 2
-    success = armController.moveToCartesianPose(0.142, -0.064, 0.400,
-                                                -0.418, 0.844, 0.238, -0.237);
-
-    if(success) {
-        RCLCPP_INFO(node->get_logger(), "Arm moved successfully!");
-    } else {
-        RCLCPP_ERROR(node->get_logger(), "Arm movement failed - pose may be unreachable");
-    }
-
-    // Additional Debug Actions
-    RCLCPP_INFO(node->get_logger(), "=== TESTING YOLO DETECTION ===");
     YoloInterface yolo(node);
-    RCLCPP_INFO(node->get_logger(), "Testing OAK-D Camera...");
-    std::string oakd_obj = yolo.getObjectName(CameraSource::OAKD, false);
-    if (!oakd_obj.empty()) {
-        RCLCPP_INFO(node->get_logger(), "OAK-D detected: %s", oakd_obj.c_str());
-    } else {
-        RCLCPP_WARN(node->get_logger(), "OAK-D detected nothing.");
-    }
-
-    RCLCPP_INFO(node->get_logger(), "Testing Wrist Camera...");
-    std::string wrist_obj = yolo.getObjectName(CameraSource::WRIST, false);
-    if (!wrist_obj.empty()) {
-        RCLCPP_INFO(node->get_logger(), "Wrist camera detected: %s", wrist_obj.c_str());
-    } else {
-        RCLCPP_WARN(node->get_logger(), "Wrist camera detected nothing.");
-    }
-
-    RCLCPP_INFO(node->get_logger(), "=== TESTING APRILTAG DETECTION ===");
     AprilTagDetector tag_detector(node);
-    std::vector<int> candidate_tags = {0, 1, 2, 3, 4, 5};
-    auto visible_tags = tag_detector.getVisibleTags(candidate_tags);
-    if (!visible_tags.empty()) {
-        RCLCPP_INFO(node->get_logger(), "Detected AprilTags: ");
-        for (int tag : visible_tags) {
-            RCLCPP_INFO(node->get_logger(), "Tag ID: %d", tag);
+
+    while (rclcpp::ok()) {
+        std::cout << "\n========================================\n";
+        std::cout << "Select a hardware component to test:\n";
+        std::cout << "1. Test Arm Control\n";
+        std::cout << "2. Test OAK-D Camera (YOLO)\n";
+        std::cout << "3. Test Wrist Camera (YOLO)\n";
+        std::cout << "4. Test AprilTag Detection\n";
+        std::cout << "5. Test Everything in One Shot\n";
+        std::cout << "0. Exit Debug Mode\n";
+        std::cout << "Enter your choice (0-5): ";
+        
+        int choice;
+        if (!(std::cin >> choice)) {
+            std::cin.clear();
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+            std::cout << "Invalid input. Please enter a number.\n";
+            continue;
         }
-    } else {
-        RCLCPP_WARN(node->get_logger(), "No AprilTags detected.");
+
+        if (choice == 0) {
+            RCLCPP_INFO(node->get_logger(), "Exiting Debug Mode.");
+            break;
+        }
+
+        bool test_arm = (choice == 1 || choice == 5);
+        bool test_oakd = (choice == 2 || choice == 5);
+        bool test_wrist = (choice == 3 || choice == 5);
+        bool test_apriltag = (choice == 4 || choice == 5);
+
+        if (test_arm) {
+            RCLCPP_INFO(node->get_logger(), "=== TESTING ARM CONTROL ===");
+            RCLCPP_INFO(node->get_logger(), "Moving arm to a reachable pose...");
+            
+            // Test arm movement with pose 1
+            bool success = armController.moveToCartesianPose(0.043, 0.199, 0.313,
+                                                             -0.471, -0.557, 0.564, -0.387);
+
+            if(success) {
+                RCLCPP_INFO(node->get_logger(), "Arm moved successfully!");
+                // Test gripper
+                RCLCPP_INFO(node->get_logger(), "Testing gripper...");
+                armController.openGripper();
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                armController.closeGripper();
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+            } else {
+                RCLCPP_ERROR(node->get_logger(), "Arm movement failed - pose may be unreachable");
+            }
+
+            // Test arm movement with pose 2
+            success = armController.moveToCartesianPose(0.142, -0.064, 0.400,
+                                                        -0.418, 0.844, 0.238, -0.237);
+
+            if(success) {
+                RCLCPP_INFO(node->get_logger(), "Arm moved successfully!");
+            } else {
+                RCLCPP_ERROR(node->get_logger(), "Arm movement failed - pose may be unreachable");
+            }
+        }
+
+        if (test_oakd) {
+            RCLCPP_INFO(node->get_logger(), "=== TESTING OAK-D CAMERA (YOLO) ===");
+            // Changed to true to save the annotated image to disk
+            std::string oakd_obj = yolo.getObjectName(CameraSource::OAKD, true);
+            if (!oakd_obj.empty()) {
+                RCLCPP_INFO(node->get_logger(), "OAK-D detected: %s (Image saved as detected_object.jpg)", oakd_obj.c_str());
+            } else {
+                RCLCPP_WARN(node->get_logger(), "OAK-D detected nothing.");
+            }
+        }
+
+        if (test_wrist) {
+            RCLCPP_INFO(node->get_logger(), "=== TESTING WRIST CAMERA (YOLO) ===");
+            // Changed to true to save the annotated image to disk
+            std::string wrist_obj = yolo.getObjectName(CameraSource::WRIST, true);
+            if (!wrist_obj.empty()) {
+                RCLCPP_INFO(node->get_logger(), "Wrist camera detected: %s (Image saved as detected_object.jpg)", wrist_obj.c_str());
+            } else {
+                RCLCPP_WARN(node->get_logger(), "Wrist camera detected nothing.");
+            }
+        }
+
+        if (test_apriltag) {
+            RCLCPP_INFO(node->get_logger(), "=== TESTING APRILTAG DETECTION ===");
+            std::vector<int> candidate_tags = {0, 1, 2, 3, 4, 5};
+            auto visible_tags = tag_detector.getVisibleTags(candidate_tags);
+            if (!visible_tags.empty()) {
+                RCLCPP_INFO(node->get_logger(), "Detected AprilTags: ");
+                for (int tag : visible_tags) {
+                    RCLCPP_INFO(node->get_logger(), "Tag ID: %d", tag);
+                }
+            } else {
+                RCLCPP_WARN(node->get_logger(), "No AprilTags detected.");
+            }
+        }
+
+        if (choice < 0 || choice > 5) {
+            std::cout << "Invalid choice. Please try again.\n";
+        }
     }
 
     RCLCPP_INFO(node->get_logger(), "=== DEBUG MODE COMPLETE ===");
@@ -183,6 +281,14 @@ int main(int argc, char** argv) {
             ArmController arm(node);
             YoloInterface yolo(node);
             
+            // 0. Move arm to a position where the wrist camera can see the top plate
+            RCLCPP_INFO(node->get_logger(), "Moving arm to look at the manipulable object...");
+            arm.moveToCartesianPose(Config::ARM_LOOK_X, Config::ARM_LOOK_Y, Config::ARM_LOOK_Z, 
+                                    Config::ARM_LOOK_ROLL, Config::ARM_LOOK_PITCH, Config::ARM_LOOK_YAW);
+            
+            // Give the camera a moment to stabilize and capture a clear frame
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+
             // 1. Detect and pick up manipulable object
             RCLCPP_INFO(node->get_logger(), "Detecting manipulable object...");
             manipulable_object_name = yolo.getObjectName(CameraSource::WRIST, true);
@@ -195,13 +301,15 @@ int main(int argc, char** argv) {
                 arm.openGripper();
                 
                 RCLCPP_INFO(node->get_logger(), "Moving arm to top plate...");
-                arm.moveToCartesianPose(0.2, 0.0, 0.2, 0.0, 1.57, 0.0); 
+                arm.moveToCartesianPose(Config::ARM_PICKUP_X, Config::ARM_PICKUP_Y, Config::ARM_PICKUP_Z, 
+                                        Config::ARM_PICKUP_ROLL, Config::ARM_PICKUP_PITCH, Config::ARM_PICKUP_YAW); 
                 
                 RCLCPP_INFO(node->get_logger(), "Closing gripper to grasp object...");
                 arm.closeGripper();
                 
                 RCLCPP_INFO(node->get_logger(), "Moving arm to carry position...");
-                arm.moveToCartesianPose(0.1, 0.0, 0.3, 0.0, 0.0, 0.0);
+                arm.moveToCartesianPose(Config::ARM_CARRY_X, Config::ARM_CARRY_Y, Config::ARM_CARRY_Z, 
+                                        Config::ARM_CARRY_ROLL, Config::ARM_CARRY_PITCH, Config::ARM_CARRY_YAW);
                 
                 RCLCPP_INFO(node->get_logger(), "Successfully picked up manipulable object.");
                 manipulable_picked = true;
@@ -263,20 +371,97 @@ int main(int argc, char** argv) {
                             std::vector<int> candidate_tags = {0, 1, 2, 3, 4, 5};
                             auto visible_tags = tag_detector.getVisibleTags(candidate_tags);
                             
+                            // OPTIMIZATION: If AprilTag is not immediately visible, spin to find it
+                            if (visible_tags.empty()) {
+                                RCLCPP_WARN(node->get_logger(), "AprilTag not immediately visible. Initiating search spin...");
+                                
+                                // Simple spin behavior: rotate in place by sending small navigation goals
+                                // or by publishing to cmd_vel directly. Since we are using Nav2, we can 
+                                // send a new goal with the same x, y but a different phi (yaw).
+                                
+                                for (int spin_step = 1; spin_step <= Config::SPIN_STEPS; ++spin_step) {
+                                    float new_phi = phi + (spin_step * Config::SPIN_INCREMENT); // Rotate
+                                    // Normalize phi to [-PI, PI]
+                                    while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
+                                    while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
+                                    
+                                    RCLCPP_INFO(node->get_logger(), "Spinning to phi=%.2f to search for AprilTag...", new_phi);
+                                    nav.moveToGoal(x, y, new_phi);
+                                    
+                                    // Check again
+                                    visible_tags = tag_detector.getVisibleTags(candidate_tags);
+                                    if (!visible_tags.empty()) {
+                                        RCLCPP_INFO(node->get_logger(), "AprilTag found after spinning!");
+                                        break;
+                                    }
+                                }
+                            }
+
                             if (!visible_tags.empty()) {
                                 int tag_id = visible_tags[0];
                                 RCLCPP_INFO(node->get_logger(), "Found AprilTag %d on the bin. Initiating placement sequence...", tag_id);
                                 
+                                // OPTIMIZATION: Use AprilTag pose to adjust robot position before dropping
+                                auto tag_pose_opt = tag_detector.getTagPose(tag_id);
+                                if (tag_pose_opt.has_value()) {
+                                    geometry_msgs::msg::Pose tag_pose = tag_pose_opt.value();
+                                    
+                                    // tag_pose is relative to the robot's base_link.
+                                    // We want to move the robot so it is exactly a certain distance (e.g., 0.4m) 
+                                    // directly in front of the tag.
+                                    
+                                    // Calculate the distance and angle to the tag
+                                    float dist_to_tag = std::sqrt(tag_pose.position.x * tag_pose.position.x + tag_pose.position.y * tag_pose.position.y);
+                                    float angle_to_tag = std::atan2(tag_pose.position.y, tag_pose.position.x);
+                                    
+                                    RCLCPP_INFO(node->get_logger(), "AprilTag is %.2fm away at angle %.2f rad.", dist_to_tag, angle_to_tag);
+                                    
+                                    // Desired distance from the bin to safely drop the object
+                                    float desired_distance = Config::DESIRED_DROP_DISTANCE; 
+                                    
+                                    // If we are too far or not facing it directly, adjust position
+                                    if (std::abs(dist_to_tag - desired_distance) > Config::DISTANCE_TOLERANCE || std::abs(angle_to_tag) > Config::ANGLE_TOLERANCE) {
+                                        RCLCPP_INFO(node->get_logger(), "Adjusting robot position to align with the bin...");
+                                        
+                                        // Calculate new goal in the map frame
+                                        // We need to move forward/backward by (dist_to_tag - desired_distance)
+                                        // and rotate by angle_to_tag
+                                        
+                                        float move_dist = dist_to_tag - desired_distance;
+                                        
+                                        // Calculate new map coordinates based on current robot pose
+                                        float new_x = robotPose.x + move_dist * std::cos(robotPose.phi + angle_to_tag);
+                                        float new_y = robotPose.y + move_dist * std::sin(robotPose.phi + angle_to_tag);
+                                        float new_phi = robotPose.phi + angle_to_tag;
+                                        
+                                        // Normalize phi
+                                        while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
+                                        while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
+                                        
+                                        RCLCPP_INFO(node->get_logger(), "Moving to aligned drop position: x=%.2f, y=%.2f, phi=%.2f", new_x, new_y, new_phi);
+                                        nav.moveToGoal(new_x, new_y, new_phi);
+                                    } else {
+                                        RCLCPP_INFO(node->get_logger(), "Robot is already perfectly aligned with the bin.");
+                                    }
+                                } else {
+                                    RCLCPP_WARN(node->get_logger(), "Could not get precise pose of AprilTag. Proceeding with current position.");
+                                }
+
                                 // Place object in bin
+                                // Note: The arm coordinates below are placeholders. 
+                                // You must calibrate these values on the real robot so the arm reaches 
+                                // forward enough to drop the object into the bin without hitting it.
                                 ArmController arm(node);
                                 RCLCPP_INFO(node->get_logger(), "Moving arm to bin position...");
-                                arm.moveToCartesianPose(0.3, 0.0, 0.1, 0.0, 1.57, 0.0);
+                                arm.moveToCartesianPose(Config::ARM_DROP_X, Config::ARM_DROP_Y, Config::ARM_DROP_Z, 
+                                                        Config::ARM_DROP_ROLL, Config::ARM_DROP_PITCH, Config::ARM_DROP_YAW);
                                 
                                 RCLCPP_INFO(node->get_logger(), "Opening gripper to release object...");
                                 arm.openGripper();
                                 
                                 RCLCPP_INFO(node->get_logger(), "Moving arm back to carry position...");
-                                arm.moveToCartesianPose(0.1, 0.0, 0.3, 0.0, 0.0, 0.0);
+                                arm.moveToCartesianPose(Config::ARM_CARRY_X, Config::ARM_CARRY_Y, Config::ARM_CARRY_Z, 
+                                                        Config::ARM_CARRY_ROLL, Config::ARM_CARRY_PITCH, Config::ARM_CARRY_YAW);
                                 
                                 RCLCPP_INFO(node->get_logger(), "Object successfully placed in the bin.");
                                 manipulable_picked = false; // Object placed
