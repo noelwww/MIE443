@@ -54,10 +54,12 @@ bool Navigation::moveToGoal(double xGoal, double yGoal, double phiGoal) {
 
 	auto goal_handle_future = action_client_->async_send_goal(goal_msg, send_goal_options);
 
-	// Wait for goal to be accepted
-	if (rclcpp::spin_until_future_complete(node_, goal_handle_future) !=
-		rclcpp::FutureReturnCode::SUCCESS) {
-		RCLCPP_ERROR(node_->get_logger(), "Failed to send goal");
+	// Wait for goal to be accepted.
+	// NOTE: We use future.wait_for() instead of spin_until_future_complete()
+	// because the node is already being spun by the MultiThreadedExecutor in main().
+	// Calling spin_until_future_complete() would crash with "already added to an executor".
+	if (goal_handle_future.wait_for(std::chrono::seconds(10)) != std::future_status::ready) {
+		RCLCPP_ERROR(node_->get_logger(), "Failed to send goal (timeout)");
 		return false;
 	}
 
@@ -70,9 +72,9 @@ bool Navigation::moveToGoal(double xGoal, double yGoal, double phiGoal) {
 	// Wait for result
 	auto result_future = action_client_->async_get_result(goal_handle);
 
-	if (rclcpp::spin_until_future_complete(node_, result_future) !=
-		rclcpp::FutureReturnCode::SUCCESS) {
-		RCLCPP_ERROR(node_->get_logger(), "Failed to get result");
+	// Wait with a generous timeout (navigation can take a while)
+	if (result_future.wait_for(std::chrono::seconds(120)) != std::future_status::ready) {
+		RCLCPP_ERROR(node_->get_logger(), "Failed to get result (timeout after 120s)");
 		return false;
 	}
 

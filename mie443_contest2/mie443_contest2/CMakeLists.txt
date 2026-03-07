@@ -171,6 +171,11 @@ install(DIRECTORY
   DESTINATION share/${PROJECT_NAME}
 )
 
+# Install launch_all.sh helper script
+install(PROGRAMS launch_all.sh
+  DESTINATION share/${PROJECT_NAME}
+)
+
 # Install header files
 install(DIRECTORY include/
   DESTINATION include

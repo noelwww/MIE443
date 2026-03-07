@@ -1,189 +1,177 @@
 #!/bin/bash
-###############################################################################
-# launch_all.sh — Start all services for MIE443 Contest 2
+# =============================================================================
+# MIE443 Contest 2 — Full System Launcher
+# =============================================================================
 #
-# Usage:
-#   ./launch_all.sh           # Run contest mode
-#   ./launch_all.sh --debug   # Run debug mode
+# This script launches ALL required nodes for the contest in separate terminals.
 #
-# Press Ctrl+C to cleanly shut down ALL processes (local + remote).
-###############################################################################
+# PREREQUISITES:
+#   1. The TurtleBot 4 is powered on and connected.
+#   2. The SO-ARM101 is plugged in (USB + battery).
+#   3. The workspace is built: colcon build --packages-select mie443_contest2
+#   4. The SLAM map files (.yaml + .pgm) are in mie443_contest2/maps/
+#   5. The box coordinates are updated in mie443_contest2/boxes_database/coords.xml
+#
+# USAGE:
+#   chmod +x launch_all.sh
+#   ./launch_all.sh                  # Normal contest mode
+#   ./launch_all.sh --debug          # Debug mode (interactive hardware testing)
+#   ./launch_all.sh --map <path>     # Specify a custom map file
+#
+# =============================================================================
 
 set -e
 
-# ─── Configuration ───────────────────────────────────────────────────────────
-PI_USER="ubuntu"
-PI_IP="100.69.127.190"
-PI_PASS="turtlebot4"
-PI_SSH="sshpass -p ${PI_PASS} ssh -o StrictHostKeyChecking=no ${PI_USER}@${PI_IP}"
-PI_WS="source ~/ros2_ws/install/setup.bash"
+# ---- Configuration ----
+TURTLEBOT_IP="${TURTLEBOT_IP:-192.168.185.3}"
+DEBUG_FLAG=""
 
-LAPTOP_ROS_SETUP="source /opt/ros/jazzy/setup.bash && source /etc/turtlebot4/setup.bash && source /home/turtlebot/ros2_ws/install/setup.bash"
+# ---- Resolve paths ----
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The maps/ folder is right next to this script in the source tree
+MAPS_DIR="$SCRIPT_DIR/maps"
+MAP_FILE="${MAP_FILE:-$MAPS_DIR/Contest2MapPractice.yaml}"
 
-# Pass through any arguments (e.g. --debug)
-CONTEST_ARGS="$*"
+# ---- Parse Arguments ----
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --debug)
+            DEBUG_FLAG="--debug"
+            shift
+            ;;
+        --map)
+            MAP_FILE="$2"
+            shift 2
+            ;;
+        --ip)
+            TURTLEBOT_IP="$2"
+            shift 2
+            ;;
+        *)
+            echo "Unknown argument: $1"
+            echo "Usage: ./launch_all.sh [--debug] [--map <path>] [--ip <turtlebot_ip>]"
+            exit 1
+            ;;
+    esac
+done
 
-# Track all background PIDs for cleanup
-PIDS=()
-SSH_PIDS=()
+# ---- Source workspace ----
+WS_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-# Terminal colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
-
-log()  { echo -e "${GREEN}[LAUNCH]${NC} $1"; }
-warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
-err()  { echo -e "${RED}[ERROR]${NC} $1"; }
-step() { echo -e "${CYAN}────────────────────────────────────────────────────${NC}"; echo -e "${CYAN}  $1${NC}"; echo -e "${CYAN}────────────────────────────────────────────────────${NC}"; }
-
-# ─── Cleanup on exit ─────────────────────────────────────────────────────────
-cleanup() {
-    echo ""
-    log "Shutting down all processes..."
-
-    # Kill local background processes
-    for pid in "${PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -INT "$pid" 2>/dev/null
-            sleep 0.5
-            kill -9 "$pid" 2>/dev/null
-        fi
-    done
-
-    # Kill remote processes on the Pi
-    log "Stopping remote processes on Pi..."
-    $PI_SSH "pkill -f image_capture_server 2>/dev/null; pkill -f so101_bridge 2>/dev/null; pkill -f so101_turtlebot 2>/dev/null" 2>/dev/null || true
-
-    # Kill SSH sessions
-    for pid in "${SSH_PIDS[@]}"; do
-        if kill -0 "$pid" 2>/dev/null; then
-            kill -9 "$pid" 2>/dev/null
-        fi
-    done
-
-    log "All processes stopped."
-    exit 0
-}
-
-trap cleanup SIGINT SIGTERM EXIT
-
-# ─── Helper: wait for a ROS 2 service to appear ─────────────────────────────
-wait_for_service() {
-    local service_name="$1"
-    local timeout="${2:-30}"
-    local elapsed=0
-    log "Waiting for service ${service_name} (timeout: ${timeout}s)..."
-    while ! ros2 service list 2>/dev/null | grep -q "$service_name"; do
-        sleep 1
-        elapsed=$((elapsed + 1))
-        if [ "$elapsed" -ge "$timeout" ]; then
-            warn "Timed out waiting for ${service_name} after ${timeout}s"
-            return 1
-        fi
-    done
-    log "Service ${service_name} is ready (${elapsed}s)"
-    return 0
-}
-
-# ─── Helper: wait for a ROS 2 node to appear ────────────────────────────────
-wait_for_node() {
-    local node_name="$1"
-    local timeout="${2:-30}"
-    local elapsed=0
-    log "Waiting for node ${node_name} (timeout: ${timeout}s)..."
-    while ! ros2 node list 2>/dev/null | grep -q "$node_name"; do
-        sleep 1
-        elapsed=$((elapsed + 1))
-        if [ "$elapsed" -ge "$timeout" ]; then
-            warn "Timed out waiting for ${node_name} after ${timeout}s"
-            return 1
-        fi
-    done
-    log "Node ${node_name} is ready (${elapsed}s)"
-    return 0
-}
-
-###############################################################################
-# STEP 1: Launch arm bridge + wrist camera on Pi
-###############################################################################
-step "Step 1/6: Starting arm bridge + wrist camera on Pi"
-
-$PI_SSH "bash -lc '${PI_WS} && ros2 launch lerobot_moveit so101_turtlebot.launch.py'" &
-SSH_PIDS+=($!)
-
-# Give the arm bridge time to initialize
-sleep 5
-wait_for_node "/so101_bridge" 30 || warn "so101_bridge not detected (may be namespace issue — continuing)"
-
-###############################################################################
-# STEP 2: Launch image_capture_server on Pi
-###############################################################################
-step "Step 2/6: Starting OAK-D image capture server on Pi"
-
-$PI_SSH "bash -lc '${PI_WS} && ros2 run mie443_contest2 image_capture_server'" &
-SSH_PIDS+=($!)
-
-sleep 3
-wait_for_service "oakd_camera/capture_image" 20 || warn "image_capture_server not detected — OAK-D may not work"
-
-###############################################################################
-# STEP 3: Launch MoveIt (move_group + rviz) on laptop
-###############################################################################
-step "Step 3/6: Starting MoveIt move_group + RViz on laptop"
-
-bash -c "${LAPTOP_ROS_SETUP} && ros2 launch lerobot_moveit so101_laptop.launch.py" &
-PIDS+=($!)
-
-sleep 5
-wait_for_node "/move_group" 30 || warn "move_group not detected — arm planning may not work"
-
-###############################################################################
-# STEP 4: Launch YOLO detector on laptop
-###############################################################################
-step "Step 4/6: Starting YOLO detector on laptop"
-
-bash -c "${LAPTOP_ROS_SETUP} && ros2 run mie443_contest2 yolo_detector.py" &
-PIDS+=($!)
-
-sleep 3
-wait_for_service "detect_object" 15 || warn "yolo_detector not detected — object detection may not work"
-
-###############################################################################
-# STEP 5: Launch AprilTag detector on laptop
-###############################################################################
-step "Step 5/6: Starting AprilTag detector on laptop"
-
-# Start the OAK-D camera first so apriltag_ros has images to process
-ros2 service call /oakd/start_camera std_srvs/srv/Trigger "{}" 2>/dev/null || true
-sleep 2
-
-bash -c "${LAPTOP_ROS_SETUP} && ros2 launch mie443_contest2 apriltag_oakd.launch.py" &
-PIDS+=($!)
-
-sleep 3
-wait_for_node "/apriltag" 10 || warn "apriltag node not detected — tag detection may not work"
-
-###############################################################################
-# STEP 6: Print summary + launch contest2
-###############################################################################
-step "Step 6/6: All services started — launching contest2"
+if [ -f "$WS_DIR/install/setup.bash" ]; then
+    source "$WS_DIR/install/setup.bash"
+    echo "[OK] Sourced workspace: $WS_DIR/install/setup.bash"
+else
+    echo "[ERROR] Could not find $WS_DIR/install/setup.bash"
+    echo "        Did you run: colcon build --packages-select mie443_contest2 ?"
+    exit 1
+fi
 
 echo ""
-log "Service status:"
-echo -e "  Arm bridge (Pi):       $(ros2 node list 2>/dev/null | grep -q so101_bridge    && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
-echo -e "  OAK-D capture (Pi):    $(ros2 service list 2>/dev/null | grep -q oakd_camera/capture_image && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
-echo -e "  Wrist capture (Pi):    $(ros2 service list 2>/dev/null | grep -q wrist_camera/capture_image && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
-echo -e "  MoveIt move_group:     $(ros2 node list 2>/dev/null | grep -q move_group      && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
-echo -e "  YOLO detector:         $(ros2 service list 2>/dev/null | grep -q detect_object && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
-echo -e "  AprilTag detector:     $(ros2 node list 2>/dev/null | grep -q apriltag         && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗${NC}")"
+echo "============================================"
+echo "  MIE443 Contest 2 — System Launcher"
+echo "============================================"
+echo "  TurtleBot IP:  $TURTLEBOT_IP"
+echo "  Map file:      $MAP_FILE"
+echo "  Mode:          $([ -z "$DEBUG_FLAG" ] && echo "CONTEST" || echo "DEBUG")"
+echo "============================================"
 echo ""
 
-log "Launching: ros2 run mie443_contest2 contest2 ${CONTEST_ARGS}"
-echo -e "${YELLOW}Press Ctrl+C to stop everything.${NC}"
+# ---- Check map file exists ----
+if [ ! -f "$MAP_FILE" ]; then
+    echo "[ERROR] Map file not found: $MAP_FILE"
+    echo "        Place your .yaml and .pgm files in mie443_contest2/maps/"
+    exit 1
+fi
+
+# ---- Function to open a new terminal with a command ----
+# Supports gnome-terminal (Ubuntu default) and xterm as fallback
+launch_terminal() {
+    local title="$1"
+    local cmd="$2"
+
+    # Source the workspace in each new terminal
+    local full_cmd="source $WS_DIR/install/setup.bash && echo '[$title] Starting...' && $cmd"
+
+    if command -v gnome-terminal &> /dev/null; then
+        gnome-terminal --title="$title" -- bash -c "$full_cmd; echo ''; echo '[$title] Process ended. Press Enter to close.'; read" &
+    elif command -v xterm &> /dev/null; then
+        xterm -T "$title" -e bash -c "$full_cmd; echo ''; echo '[$title] Process ended. Press Enter to close.'; read" &
+    else
+        echo "[WARN] No terminal emulator found (gnome-terminal or xterm)."
+        echo "       Please run manually: $cmd"
+    fi
+
+    sleep 1  # Give each terminal a moment to start
+}
+
+echo "=== Step 1/7: Launching AMCL Localization ==="
+launch_terminal "AMCL Localization" \
+    "ros2 launch turtlebot4_navigation localization.launch.py map:=$MAP_FILE"
+
+echo "=== Step 2/7: Launching Nav2 Navigation ==="
+launch_terminal "Nav2 Navigation" \
+    "ros2 launch turtlebot4_navigation nav2.launch.py"
+
+echo "=== Step 3/7: Launching RViz ==="
+launch_terminal "RViz" \
+    "ros2 launch turtlebot4_viz view_navigation.launch.py"
+
+echo ""
+echo "============================================"
+echo "  IMPORTANT: Waiting for you to localize!"
+echo "============================================"
+echo "  1. In the RViz window that just opened,"
+echo "     click the '2D Pose Estimate' button."
+echo "  2. Click and drag on the map to indicate"
+echo "     the robot's current position and heading."
+echo "  3. The robot should now show on the map."
+echo ""
+read -p "  Press ENTER once the robot is localized in RViz..."
 echo ""
 
-# Run contest2 in foreground (blocking) — Ctrl+C triggers cleanup
-bash -c "${LAPTOP_ROS_SETUP} && ros2 run mie443_contest2 contest2 ${CONTEST_ARGS}"
+echo "=== Step 4/7: Launching MoveIt (Laptop side) ==="
+launch_terminal "MoveIt Laptop" \
+    "ros2 launch lerobot_moveit so101_laptop.launch.py"
+
+echo "=== Step 5/7: Launching AprilTag Detector ==="
+launch_terminal "AprilTag Detector" \
+    "ros2 launch mie443_contest2 apriltag_oakd.launch.py"
+
+echo "=== Step 6/7: Launching YOLO Detector ==="
+launch_terminal "YOLO Detector" \
+    "ros2 run mie443_contest2 yolo_detector"
+
+echo "=== Step 7/7: Launching Contest 2 Node ==="
+sleep 3  # Give AprilTag, YOLO, and MoveIt a moment to initialize
+
+if [ -z "$DEBUG_FLAG" ]; then
+    echo "[INFO] Starting CONTEST mode. Timer begins when node starts!"
+    launch_terminal "Contest2 Main" \
+        "ros2 run mie443_contest2 contest2"
+else
+    echo "[INFO] Starting DEBUG mode. Interactive hardware testing."
+    launch_terminal "Contest2 Debug" \
+        "ros2 run mie443_contest2 contest2 --debug"
+fi
+
+echo ""
+echo "============================================"
+echo "  All LAPTOP nodes launched!"
+echo "============================================"
+echo ""
+echo "  REMINDER: The following must ALREADY be"
+echo "  running on the TurtleBot via SSH."
+echo ""
+echo "  If not, open two SSH terminals now:"
+echo "    ssh ubuntu@$TURTLEBOT_IP"
+echo ""
+echo "    SSH Terminal 1 — Image Capture Server:"
+echo "      ros2 run mie443_contest2 image_capture_server"
+echo ""
+echo "    SSH Terminal 2 — SO-ARM101 Hardware Bridge:"
+echo "      ros2 launch lerobot_moveit so101_turtlebot.launch.py"
+echo ""
+echo "============================================"
+echo "  To stop everything: Ctrl+C in each terminal"
+echo "============================================"
