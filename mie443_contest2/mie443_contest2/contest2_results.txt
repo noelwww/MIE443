@@ -1,0 +1,11 @@
+=== CONTEST 2 RESULTS ===
+Mode: FULL (with arm)
+Manipulable Object: cup
+Object Placed: NO
+Boxes Visited: 5/5
+
+Detected Scene Objects:
+
+AprilTag Detections: NONE
+
+Time Elapsed: 52 seconds
