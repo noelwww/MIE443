@@ -34,6 +34,7 @@ find_package(moveit_msgs QUIET)
 find_package(nav2_msgs QUIET)
 find_package(nav2_util QUIET)
 find_package(orocos_kdl QUIET)
+find_package(yaml-cpp REQUIRED)
 
 # Check if MoveIt is available
 if(moveit_ros_planning_interface_FOUND AND moveit_msgs_FOUND)
@@ -139,6 +140,7 @@ if(MOVEIT_AVAILABLE AND NAV2_AVAILABLE)
   target_link_libraries(contest2
     ${OpenCV_LIBRARIES}
     ${orocos_kdl_LIBRARIES}
+    yaml-cpp
   )
 
   # Link custom messages to contest2
@@ -156,10 +158,11 @@ endif()
 # COMMON INSTALLS (always)
 # ============================================================================
 
-# Install Python scripts
+# Install Python scripts (rename to drop .py extension for ros2 run compatibility)
 install(PROGRAMS
   src/yolo_detector.py
   DESTINATION lib/${PROJECT_NAME}
+  RENAME yolo_detector
 )
 
 # Install directories

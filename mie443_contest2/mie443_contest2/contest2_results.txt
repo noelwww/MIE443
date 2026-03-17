@@ -8,4 +8,4 @@ Detected Scene Objects:
 
 AprilTag Detections: NONE
 
-Time Elapsed: 52 seconds
+Time Elapsed: 133 seconds

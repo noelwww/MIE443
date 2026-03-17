@@ -21,112 +21,267 @@
 #include <iomanip>
 #include <sys/select.h>
 #include <unistd.h>
+#include <yaml-cpp/yaml.h>
 
 // =============================================================================
 // CONTEST CONFIGURATION PARAMETERS
-// Adjust these values during physical testing on the real robot.
+// Loaded from arm_poses.yaml at runtime — edit the YAML, no rebuild needed!
+// Search order: ./arm_poses.yaml → installed share path → hardcoded defaults.
 // =============================================================================
 namespace Config {
     // --- Arm Poses as JOINT VALUES (radians) ---
-    // These bypass IK entirely — the most reliable way to reach known poses
-    // on the 5-DOF SO-ARM101. Record using debug option 7 with arm positioned.
-    // Leave empty {} to fall back to Cartesian targets below.
-    const std::vector<double> ARM_LOOK_JOINTS = {-1.70983, -0.730833172, 0.719931, 1.6410469858, 1.46864237};
-     // fill from debug 7
-    const std::vector<double> ARM_PICKUP_JOINTS = {-1.794406, -1.0182992, 1.1159992, 1.384434, 1.086024};   // fill from debug 7
-    const std::vector<double> ARM_CARRY_JOINTS = {-0.1888849, -1.61452531, 0.30579128, 1.3234707, 1.0787};   // fill from debug 7
-    const std::vector<double> ARM_DROP_JOINTS = {-0.1395492, 0.8129663, -1.20920725, 1.20863287, 1.080205};
-     // fill from debug 7
+    std::vector<double> ARM_LOOK_JOINTS   = {-1.70983, -0.730833172, 0.719931, 1.6410469858, 1.46864237};
+    std::vector<double> ARM_PICKUP_JOINTS = {-1.794406, -1.0182992, 1.1159992, 1.384434, 1.086024};
+    std::vector<double> ARM_CARRY_JOINTS  = {-1.800044, -1.4320071, 0.929259, 1.6438824, 1.0511085};
+    std::vector<double> ARM_DROP_JOINTS   = {-0.1395492, 0.8129663, -1.20920725, 1.20863287, 1.080205};
 
     // --- Arm Poses (x, y, z, qx, qy, qz, qw) --- QUATERNION format (fallback)
-    // Used when joint values above are empty.
-    // To get these values: move the arm in RViz/MoveIt, then run:
-    //   ros2 topic echo /arm_moveit/display_planned_path --once
-    // or read the end-effector pose from MoveIt's planning scene.
+    float ARM_LOOK_X = 0.115049f;   float ARM_LOOK_Y = 0.00866053f;  float ARM_LOOK_Z = 0.182472f;
+    float ARM_LOOK_QX = 0.0771996f; float ARM_LOOK_QY = 0.0283588f;  float ARM_LOOK_QZ = 0.996288f;  float ARM_LOOK_QW = 0.025429f;
 
-    // Pose to look at the object on the top plate before picking it up
-    const float ARM_LOOK_X = 0.115049;
-    const float ARM_LOOK_Y = 0.00866053;
-    const float ARM_LOOK_Z = 0.182472;
-    const float ARM_LOOK_QX = 0.0771996;
-    const float ARM_LOOK_QY = 0.0283588;   // ~1.0 rad pitch downward
-    const float ARM_LOOK_QZ = 0.996288;
-    const float ARM_LOOK_QW = 0.025429;
+    float ARM_PICKUP_X = 0.103496f;    float ARM_PICKUP_Y = 0.00683864f;  float ARM_PICKUP_Z = 0.154764f;
+    float ARM_PICKUP_QX = 0.0100663f;  float ARM_PICKUP_QY = -0.0163231f; float ARM_PICKUP_QZ = -0.201975f; float ARM_PICKUP_QW = 0.979203f;
 
-    // Pose to pick up the manipulable object from the top plate
-    const float ARM_PICKUP_X = 0.103496;
-    const float ARM_PICKUP_Y = 0.00683864;
-    const float ARM_PICKUP_Z = 0.154764;
-    const float ARM_PICKUP_QX = 0.0100663;
-    const float ARM_PICKUP_QY = -0.0163231;  // ~90° pitch (pointing down)
-    const float ARM_PICKUP_QZ = -0.201975;
-    const float ARM_PICKUP_QW = 0.979203;
-    
-    // Pose to carry the object while navigating
-    const float ARM_CARRY_X = 0.0636712;
-    const float ARM_CARRY_Y = -0.0981863;
-    const float ARM_CARRY_Z = 0.238941;
-    const float ARM_CARRY_QX = 0.444479;
-    const float ARM_CARRY_QY = 0.864106;      // Upright / no rotation
-    const float ARM_CARRY_QZ = 0.128399;
-    const float ARM_CARRY_QW = -0.198173;
-    
-    // Pose to drop the object into the bin
-    const float ARM_DROP_X = 0.0243134;
-    const float ARM_DROP_Y = -0.242021;
-    const float ARM_DROP_Z = 0.259773;
-    const float ARM_DROP_QX = -0.153172;
-    const float ARM_DROP_QY = -0.174677;    // ~90° pitch (pointing down)
-    const float ARM_DROP_QZ = -0.720359;
-    const float ARM_DROP_QW = 0.653536;
+    float ARM_CARRY_X = 0.0636712f;  float ARM_CARRY_Y = -0.0981863f;  float ARM_CARRY_Z = 0.238941f;
+    float ARM_CARRY_QX = 0.444479f;  float ARM_CARRY_QY = 0.864106f;   float ARM_CARRY_QZ = 0.128399f;  float ARM_CARRY_QW = -0.198173f;
+
+    float ARM_DROP_X = 0.0243134f;   float ARM_DROP_Y = -0.242021f;    float ARM_DROP_Z = 0.259773f;
+    float ARM_DROP_QX = -0.153172f;  float ARM_DROP_QY = -0.174677f;   float ARM_DROP_QZ = -0.720359f;  float ARM_DROP_QW = 0.653536f;
 
     // --- Alignment Parameters ---
-    // Desired distance from the AprilTag to safely drop the object (in meters)
-    const float DESIRED_DROP_DISTANCE = 0.4;
-    
-    // Tolerance for distance alignment (in meters)
-    const float DISTANCE_TOLERANCE = 0.05;
-    
-    // Tolerance for angle alignment (in radians)
-    const float ANGLE_TOLERANCE = 0.1;
+    float DESIRED_DROP_DISTANCE = 0.2f;
+    float DISTANCE_TOLERANCE = 0.05f;
+    float ANGLE_TOLERANCE = 0.1f;
 
     // --- Search Spin Parameters ---
-    // Number of steps for a full 360-degree spin (12 × 30° = 360°)
     const int SPIN_STEPS = 12;
-    
-    // Angle increment per spin step (in radians) — 30 degrees
     const float SPIN_INCREMENT = M_PI / 6.0;
-
-    // --- Spin velocity for in-place rotation (rad/s) ---
     const double SPIN_ANGULAR_VEL = 0.5;
-    
-    // Duration per spin step (seconds): SPIN_INCREMENT / SPIN_ANGULAR_VEL
     const double SPIN_STEP_DURATION = SPIN_INCREMENT / SPIN_ANGULAR_VEL;
 
     // --- AprilTag Candidate IDs ---
     const std::vector<int> CANDIDATE_TAG_IDS = {0, 1, 2, 3, 4, 5};
 
     // --- YOLO Detection Parameters ---
-    // Number of retry attempts for YOLO detection (reduces false negatives)
-    const int YOLO_MAX_RETRIES = 2;
-    // Delay between retries (seconds)
-    const double YOLO_RETRY_DELAY = 1.0;
+    int YOLO_MAX_RETRIES = 4;
+    double YOLO_RETRY_DELAY = 1.0;
 
     // --- Scene Object Search Spin Parameters ---
-    // Full 360° search: 12 steps × 30° = 360°
-    const int SCENE_SPIN_STEPS = 12;
-    // 30 degrees per step
-    const float SCENE_SPIN_INCREMENT = M_PI / 6.0;
-    const double SCENE_SPIN_DURATION = SCENE_SPIN_INCREMENT / SPIN_ANGULAR_VEL;
+    // Sweep ±90° from arrival heading: 9 steps × 20° = 180° total
+    int SCENE_SPIN_STEPS = 9;
+    // 20 degrees per step
+    float SCENE_SPIN_INCREMENT = M_PI / 9.0;
+    double SCENE_SPIN_DURATION = SCENE_SPIN_INCREMENT / SPIN_ANGULAR_VEL;
 
     // --- Standoff Distance ---
-    // How far back from the coordinate the robot should stop (meters).
-    // Prevents the robot from being ON the object (behind camera FOV).
     const float STANDOFF_DISTANCE = 0.5;
 
+    // --- Costmap Orbit Parameters (AprilTag search) ---
+    // How far from the robot to search for obstacle clusters on the costmap (m)
+    double ORBIT_SEARCH_RADIUS = 1.5;
+    // Distance from obstacle centroid to place orbit viewpoints (m)
+    double ORBIT_RADIUS = 0.55;
+    // Number of evenly-spaced candidate viewpoints around the obstacle
+    int ORBIT_NUM_VIEWPOINTS = 12;
+    // Max obstacle area to classify as a "bin" (m²); larger = wall
+    double ORBIT_MAX_BIN_AREA = 0.5;
+    // Costmap cost threshold: cells >= this are considered blocked (0-100 scale)
+    int ORBIT_COST_THRESHOLD = 80;
+    // Robot footprint radius for free-space checks (m)
+    double ORBIT_ROBOT_RADIUS = 0.22;
+    // If all viewpoints are blocked, retry at this fraction of orbit_radius
+    double ORBIT_FALLBACK_RADIUS_RATIO = 0.7;
+    // Navigation timeout for each orbit viewpoint move (s)
+    double ORBIT_VIEWPOINT_TIMEOUT = 10.0;
+
     // --- Time Budget ---
-    // Seconds reserved at end of contest to return to start position.
-    const int TIME_RESERVE_SECONDS = 45;
+    int TIME_RESERVE_SECONDS = 45;
+
+    // Path to the YAML file that was actually loaded (empty = defaults)
+    std::string loaded_yaml_path = "";
+}
+
+// Load arm poses from YAML file. Returns the path loaded, or "" if defaults used.
+static std::string loadConfigFromYaml(rclcpp::Logger logger) {
+    // Search order: CWD → installed share path
+    std::vector<std::string> search_paths;
+    search_paths.push_back("./arm_poses.yaml");
+    try {
+        std::string share = ament_index_cpp::get_package_share_directory("mie443_contest2");
+        search_paths.push_back(share + "/config/arm_poses.yaml");
+    } catch (...) {}
+
+    std::string yaml_path;
+    for (const auto& p : search_paths) {
+        std::ifstream test(p);
+        if (test.good()) {
+            yaml_path = p;
+            break;
+        }
+    }
+
+    if (yaml_path.empty()) {
+        RCLCPP_WARN(logger, "[Config] arm_poses.yaml not found. Using hardcoded defaults.");
+        RCLCPP_WARN(logger, "[Config] Searched: %s", search_paths.front().c_str());
+        return "";
+    }
+
+    try {
+        YAML::Node cfg = YAML::LoadFile(yaml_path);
+        RCLCPP_INFO(logger, "[Config] Loading arm poses from: %s", yaml_path.c_str());
+
+        // Helper lambdas
+        auto readVec = [&](const std::string& key, std::vector<double>& out) {
+            if (cfg[key] && cfg[key].IsSequence()) {
+                out.clear();
+                for (const auto& v : cfg[key]) out.push_back(v.as<double>());
+            }
+        };
+        auto readCartesian = [&](const std::string& key,
+                                  float& x, float& y, float& z,
+                                  float& qx, float& qy, float& qz, float& qw) {
+            if (cfg[key] && cfg[key].IsSequence() && cfg[key].size() == 7) {
+                x  = cfg[key][0].as<float>();
+                y  = cfg[key][1].as<float>();
+                z  = cfg[key][2].as<float>();
+                qx = cfg[key][3].as<float>();
+                qy = cfg[key][4].as<float>();
+                qz = cfg[key][5].as<float>();
+                qw = cfg[key][6].as<float>();
+            }
+        };
+        auto readFloat = [&](const std::string& key, float& out) {
+            if (cfg[key]) out = cfg[key].as<float>();
+        };
+        auto readInt = [&](const std::string& key, int& out) {
+            if (cfg[key]) out = cfg[key].as<int>();
+        };
+        auto readDouble = [&](const std::string& key, double& out) {
+            if (cfg[key]) out = cfg[key].as<double>();
+        };
+
+        // Joint targets
+        readVec("arm_look_joints",   Config::ARM_LOOK_JOINTS);
+        readVec("arm_pickup_joints", Config::ARM_PICKUP_JOINTS);
+        readVec("arm_carry_joints",  Config::ARM_CARRY_JOINTS);
+        readVec("arm_drop_joints",   Config::ARM_DROP_JOINTS);
+
+        // Cartesian fallbacks
+        readCartesian("arm_look_cartesian",
+            Config::ARM_LOOK_X, Config::ARM_LOOK_Y, Config::ARM_LOOK_Z,
+            Config::ARM_LOOK_QX, Config::ARM_LOOK_QY, Config::ARM_LOOK_QZ, Config::ARM_LOOK_QW);
+        readCartesian("arm_pickup_cartesian",
+            Config::ARM_PICKUP_X, Config::ARM_PICKUP_Y, Config::ARM_PICKUP_Z,
+            Config::ARM_PICKUP_QX, Config::ARM_PICKUP_QY, Config::ARM_PICKUP_QZ, Config::ARM_PICKUP_QW);
+        readCartesian("arm_carry_cartesian",
+            Config::ARM_CARRY_X, Config::ARM_CARRY_Y, Config::ARM_CARRY_Z,
+            Config::ARM_CARRY_QX, Config::ARM_CARRY_QY, Config::ARM_CARRY_QZ, Config::ARM_CARRY_QW);
+        readCartesian("arm_drop_cartesian",
+            Config::ARM_DROP_X, Config::ARM_DROP_Y, Config::ARM_DROP_Z,
+            Config::ARM_DROP_QX, Config::ARM_DROP_QY, Config::ARM_DROP_QZ, Config::ARM_DROP_QW);
+
+        // Scalar params
+        readFloat("desired_drop_distance", Config::DESIRED_DROP_DISTANCE);
+        readFloat("distance_tolerance",    Config::DISTANCE_TOLERANCE);
+        readFloat("angle_tolerance",       Config::ANGLE_TOLERANCE);
+        readInt("yolo_max_retries",        Config::YOLO_MAX_RETRIES);
+        readDouble("yolo_retry_delay",     Config::YOLO_RETRY_DELAY);
+        readInt("time_reserve_seconds",    Config::TIME_RESERVE_SECONDS);
+
+        // Scene spin search parameters
+        readInt("scene_spin_steps",        Config::SCENE_SPIN_STEPS);
+        if (cfg["scene_spin_step_deg"]) {
+            float deg = cfg["scene_spin_step_deg"].as<float>();
+            Config::SCENE_SPIN_INCREMENT = deg * M_PI / 180.0f;
+            Config::SCENE_SPIN_DURATION  = Config::SCENE_SPIN_INCREMENT / Config::SPIN_ANGULAR_VEL;
+            RCLCPP_INFO(logger, "  SCENE_SPIN: %d steps × %.0f° = %.0f° sweep",
+                        Config::SCENE_SPIN_STEPS, deg, Config::SCENE_SPIN_STEPS * deg);
+        }
+
+        // Log what was loaded
+        auto logJoints = [&](const std::string& name, const std::vector<double>& j) {
+            std::ostringstream ss;
+            ss << "  " << name << ": [";
+            for (size_t i = 0; i < j.size(); ++i) {
+                if (i > 0) ss << ", ";
+                ss << std::fixed << std::setprecision(6) << j[i];
+            }
+            ss << "]";
+            RCLCPP_INFO(logger, "%s", ss.str().c_str());
+        };
+        logJoints("LOOK",   Config::ARM_LOOK_JOINTS);
+        logJoints("PICKUP", Config::ARM_PICKUP_JOINTS);
+        logJoints("CARRY",  Config::ARM_CARRY_JOINTS);
+        logJoints("DROP",   Config::ARM_DROP_JOINTS);
+
+        Config::loaded_yaml_path = yaml_path;
+        return yaml_path;
+
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(logger, "[Config] Failed to parse %s: %s", yaml_path.c_str(), e.what());
+        RCLCPP_WARN(logger, "[Config] Using hardcoded defaults.");
+        return "";
+    }
+}
+
+// Save current joint values to the YAML file for a given pose name
+static bool saveJointsToYaml(const std::string& pose_name,
+                              const std::vector<double>& joints,
+                              rclcpp::Logger logger) {
+    // Determine which YAML file to write to
+    std::string yaml_path = Config::loaded_yaml_path;
+    if (yaml_path.empty()) {
+        // Default to CWD
+        yaml_path = "./arm_poses.yaml";
+    }
+
+    // Map pose name to YAML key
+    std::string key;
+    if (pose_name == "LOOK")        key = "arm_look_joints";
+    else if (pose_name == "PICKUP") key = "arm_pickup_joints";
+    else if (pose_name == "CARRY")  key = "arm_carry_joints";
+    else if (pose_name == "DROP")   key = "arm_drop_joints";
+    else {
+        RCLCPP_ERROR(logger, "Unknown pose name: %s", pose_name.c_str());
+        return false;
+    }
+
+    try {
+        // Load existing YAML (or create new)
+        YAML::Node cfg;
+        std::ifstream test(yaml_path);
+        if (test.good()) {
+            test.close();
+            cfg = YAML::LoadFile(yaml_path);
+        }
+
+        // Update the specific key
+        cfg[key] = joints;
+
+        // Write back
+        std::ofstream out(yaml_path);
+        if (!out.is_open()) {
+            RCLCPP_ERROR(logger, "Cannot write to %s", yaml_path.c_str());
+            return false;
+        }
+        out << "# MIE443 Contest 2 — Arm Pose Configuration\n";
+        out << "# Auto-updated by debug mode. Edit freely — no rebuild needed!\n\n";
+        out << cfg;
+        out.close();
+
+        RCLCPP_INFO(logger, "Saved %s joints to %s (key: %s)", pose_name.c_str(), yaml_path.c_str(), key.c_str());
+
+        // Also update in-memory Config
+        if (pose_name == "LOOK")        Config::ARM_LOOK_JOINTS = joints;
+        else if (pose_name == "PICKUP") Config::ARM_PICKUP_JOINTS = joints;
+        else if (pose_name == "CARRY")  Config::ARM_CARRY_JOINTS = joints;
+        else if (pose_name == "DROP")   Config::ARM_DROP_JOINTS = joints;
+
+        return true;
+    } catch (const std::exception& e) {
+        RCLCPP_ERROR(logger, "Failed to save YAML: %s", e.what());
+        return false;
+    }
 }
 // =============================================================================
 
@@ -174,8 +329,9 @@ void runDebugMode(std::shared_ptr<rclcpp::Node> node) {
         std::cout << "7. Read Current Arm Pose (for calibrating Config values)\n";
         std::cout << "8. Interactive Pose Tuning (move arm, read, repeat)\n";
         std::cout << "9. Step-by-Step Pick & Place (LOOK→detect→PICKUP→CARRY→DROP)\n";
+        std::cout << "10. Save Current Joints to arm_poses.yaml (LOOK/PICKUP/CARRY/DROP)\n";
         std::cout << "0. Exit Debug Mode\n";
-        std::cout << "Enter your choice (0-9): ";
+        std::cout << "Enter your choice (0-10): ";
         
         int choice;
         if (!(std::cin >> choice)) {
@@ -651,7 +807,41 @@ void runDebugMode(std::shared_ptr<rclcpp::Node> node) {
             RCLCPP_INFO(node->get_logger(), "=== STEP-BY-STEP COMPLETE ===");
         }
 
-        if (choice < 0 || choice > 9) {
+        if (choice == 10) {
+            RCLCPP_INFO(node->get_logger(), "=== SAVE CURRENT JOINTS TO YAML ===");
+            std::cout << "Which pose to save? (LOOK / PICKUP / CARRY / DROP): ";
+            std::string pose_name;
+            std::cin >> pose_name;
+            // Uppercase it
+            for (auto& c : pose_name) c = std::toupper(c);
+
+            if (pose_name != "LOOK" && pose_name != "PICKUP" &&
+                pose_name != "CARRY" && pose_name != "DROP") {
+                std::cout << "Invalid pose name. Must be LOOK, PICKUP, CARRY, or DROP.\n";
+            } else {
+                auto joints = armController.getCurrentJointValues();
+                if (joints.empty()) {
+                    RCLCPP_ERROR(node->get_logger(), "Cannot read joint values!");
+                } else {
+                    std::cout << "Current joints: [";
+                    for (size_t i = 0; i < joints.size(); ++i) {
+                        if (i > 0) std::cout << ", ";
+                        std::cout << joints[i];
+                    }
+                    std::cout << "]\n";
+                    std::cout << "Save these as " << pose_name << " joints? (y/n): ";
+                    std::string confirm;
+                    std::cin >> confirm;
+                    if (confirm == "y" || confirm == "Y") {
+                        saveJointsToYaml(pose_name, joints, node->get_logger());
+                    } else {
+                        std::cout << "Cancelled.\n";
+                    }
+                }
+            }
+        }
+
+        if (choice < 0 || choice > 10) {
             std::cout << "Invalid choice. Please try again.\n";
         }
     }
@@ -719,6 +909,9 @@ int main(int argc, char** argv) {
     }
     RCLCPP_INFO(node->get_logger(), "Flags: debug=%s, no_arm=%s",
         debug_mode ? "true" : "false", no_arm_mode ? "true" : "false");
+
+    // Load arm poses from YAML config (edit arm_poses.yaml — no rebuild needed!)
+    loadConfigFromYaml(node->get_logger());
 
     // Load the arm URDF and SRDF only when arm is enabled
     if (!no_arm_mode) {
@@ -1037,8 +1230,15 @@ int main(int argc, char** argv) {
                 continue;
             }
             
-            RCLCPP_INFO(node->get_logger(), "[%lus] Arrived at box %d (%.2f, %.2f, %.1fdeg). Detecting scene object...",
+            RCLCPP_INFO(node->get_logger(), "[%lus] Arrived at box %d (%.2f, %.2f, %.1fdeg). Warming up camera...",
                         secondsElapsed, current_box_index, x, y, phi * 180.0 / M_PI);
+
+            // Camera warm-up: give OAK-D time to start streaming fresh frames
+            // after being idle during navigation. Without this, the first capture
+            // often returns a stale cached frame.
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            
+            RCLCPP_INFO(node->get_logger(), "[%lus] Detecting scene object...", secondsElapsed);
             
             // Detect scene object using the front-facing OAK-D camera (with retries)
             std::string scene_object_name;
@@ -1052,33 +1252,54 @@ int main(int argc, char** argv) {
                 }
             }
             
-            // If still nothing, spin in small steps and try again
+            // If still nothing, sweep ±90° from arrival heading to search.
+            // The object is known to be within 180° of the arrival heading.
+            // Strategy: rotate to -90° first, then sweep forward in 20° steps.
             if (scene_object_name.empty()) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object after %d retries. Spinning to search...",
+                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object after %d retries. Sweeping ±90° to search...",
                             secondsElapsed, Config::YOLO_MAX_RETRIES);
-                
-                for (int spin_step = 1; spin_step <= Config::SCENE_SPIN_STEPS; ++spin_step) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] Search spin step %d/%d (%.0f deg)...",
-                                secondsElapsed, spin_step, Config::SCENE_SPIN_STEPS,
-                                Config::SCENE_SPIN_INCREMENT * 180.0 / M_PI);
-                    
-                    // Use Nav2 Spin behavior (properly controls the robot base)
-                    if (!nav.spin(Config::SCENE_SPIN_INCREMENT)) {
-                        RCLCPP_WARN(node->get_logger(), "[%lus] Nav2 Spin failed, using moveToGoal rotation...", secondsElapsed);
-                        float new_phi = robotPose.phi + Config::SCENE_SPIN_INCREMENT;
-                        while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
-                        while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
-                        nav.moveToGoal(robotPose.x, robotPose.y, new_phi);
-                    }
-                    
-                    // Settle and detect
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    
-                    scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                    if (!scene_object_name.empty()) {
-                        RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found after spin step %d!",
-                                    secondsElapsed, spin_step);
-                        break;
+
+                // Save arrival heading so we can compute absolute targets
+                float arrival_phi = phi;
+
+                // Step 1: Rotate to -90° from arrival heading
+                float start_phi = arrival_phi - M_PI / 2.0;
+                while (start_phi > M_PI) start_phi -= 2.0 * M_PI;
+                while (start_phi < -M_PI) start_phi += 2.0 * M_PI;
+
+                RCLCPP_INFO(node->get_logger(), "[%lus] Rotating to -90° (%.1fdeg) to start sweep...",
+                            secondsElapsed, start_phi * 180.0 / M_PI);
+                nav.moveToGoal(robotPose.x, robotPose.y, start_phi, 10.0);
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+
+                // Try detection at -90° position
+                scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
+                if (!scene_object_name.empty()) {
+                    RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found at -90°!", secondsElapsed);
+                }
+
+                // Step 2: Sweep from -90° to +90° in 20° steps
+                if (scene_object_name.empty()) {
+                    for (int spin_step = 1; spin_step <= Config::SCENE_SPIN_STEPS; ++spin_step) {
+                        float target_phi = start_phi + spin_step * Config::SCENE_SPIN_INCREMENT;
+                        while (target_phi > M_PI) target_phi -= 2.0 * M_PI;
+                        while (target_phi < -M_PI) target_phi += 2.0 * M_PI;
+
+                        RCLCPP_INFO(node->get_logger(), "[%lus] Sweep step %d/%d → %.1fdeg...",
+                                    secondsElapsed, spin_step, Config::SCENE_SPIN_STEPS,
+                                    target_phi * 180.0 / M_PI);
+
+                        nav.moveToGoal(robotPose.x, robotPose.y, target_phi, 10.0);
+
+                        // Settle and detect
+                        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+
+                        scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
+                        if (!scene_object_name.empty()) {
+                            RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found at sweep step %d!",
+                                        secondsElapsed, spin_step);
+                            break;
+                        }
                     }
                 }
             }
@@ -1136,25 +1357,56 @@ int main(int argc, char** argv) {
                     secondsElapsed);
             }
             
-            // If no tag seen yet, spin 360° to find it (tag faces one direction only)
+            // If no tag seen yet, use costmap orbit to view the bin from multiple angles.
+            // The tag faces one direction only — the orbit places the robot at viewpoints
+            // around the nearest obstacle (the bin) so it can check each face.
             if (best_tag_id < 0) {
-                RCLCPP_INFO(node->get_logger(), "[%lus] Spinning 360° to search for AprilTag on bin...",
-                            secondsElapsed);
-                for (int spin_step = 1; spin_step <= Config::SPIN_STEPS; ++spin_step) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] AprilTag search spin %d/%d (%.0f deg)...",
-                                secondsElapsed, spin_step, Config::SPIN_STEPS,
-                                Config::SPIN_INCREMENT * 180.0 / M_PI);
-                    if (!nav.spin(Config::SPIN_INCREMENT)) {
-                        float new_phi = robotPose.phi + Config::SPIN_INCREMENT;
-                        while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
-                        while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
-                        nav.moveToGoal(robotPose.x, robotPose.y, new_phi);
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] AprilTag not visible. Starting costmap orbit search...",
+                    secondsElapsed);
+
+                // --- Step 1: Find the nearest obstacle cluster (the bin) ---
+                double obs_cx, obs_cy;
+                bool obs_found = nav.findNearestObstacle(
+                    robotPose.x, robotPose.y, obs_cx, obs_cy,
+                    Config::ORBIT_SEARCH_RADIUS, x, y,
+                    Config::ORBIT_MAX_BIN_AREA, Config::ORBIT_COST_THRESHOLD);
+
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] Obstacle centroid: (%.2f, %.2f) [%s]",
+                    secondsElapsed, obs_cx, obs_cy,
+                    obs_found ? "costmap" : "fallback=coords.xml");
+
+                // --- Step 2: Generate orbit viewpoints ---
+                auto viewpoints = nav.generateViewpoints(
+                    obs_cx, obs_cy, robotPose.x, robotPose.y,
+                    Config::ORBIT_RADIUS, Config::ORBIT_NUM_VIEWPOINTS,
+                    Config::ORBIT_ROBOT_RADIUS, Config::ORBIT_FALLBACK_RADIUS_RATIO);
+
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] %zu orbit viewpoints generated around (%.2f, %.2f).",
+                    secondsElapsed, viewpoints.size(), obs_cx, obs_cy);
+
+                // --- Step 3: Visit viewpoints, check AprilTag at each ---
+                for (size_t vp_idx = 0; vp_idx < viewpoints.size() && best_tag_id < 0; ++vp_idx) {
+                    auto& vp = viewpoints[vp_idx];
+                    RCLCPP_INFO(node->get_logger(),
+                        "[%lus] Orbit viewpoint %zu/%zu → (%.2f, %.2f, %.1fdeg)",
+                        secondsElapsed, vp_idx + 1, viewpoints.size(),
+                        vp.x, vp.y, vp.yaw * 180.0 / M_PI);
+
+                    if (!nav.moveToGoal(vp.x, vp.y, vp.yaw, Config::ORBIT_VIEWPOINT_TIMEOUT)) {
+                        RCLCPP_WARN(node->get_logger(),
+                            "[%lus] Failed to reach viewpoint %zu. Trying next.",
+                            secondsElapsed, vp_idx + 1);
+                        continue;
                     }
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    
-                    auto spin_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
-                    if (!spin_tags.empty()) {
-                        for (int tid : spin_tags) {
+
+                    // Check for AprilTag
+                    auto orbit_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
+                    if (!orbit_tags.empty()) {
+                        for (int tid : orbit_tags) {
                             auto tp_opt = tag_detector->getTagPose(tid);
                             if (tp_opt.has_value()) {
                                 auto& tp = tp_opt.value();
@@ -1162,8 +1414,10 @@ int main(int argc, char** argv) {
                                                        tp.position.y * tp.position.y);
                                 float angle = std::atan2(tp.position.y, tp.position.x);
                                 RCLCPP_INFO(node->get_logger(),
-                                    "[%lus] [AprilTag] ID=%d found at spin step %d | dist=%.3fm | angle=%.1fdeg",
-                                    secondsElapsed, tid, spin_step, dist, angle * 180.0 / M_PI);
+                                    "[%lus] [AprilTag] ID=%d found at orbit viewpoint %zu | "
+                                    "dist=%.3fm | angle=%.1fdeg",
+                                    secondsElapsed, tid, vp_idx + 1,
+                                    dist, angle * 180.0 / M_PI);
                                 detected_apriltags.push_back({current_box_index, tid, dist,
                                     angle * 180.0f / (float)M_PI,
                                     (float)tp.position.x, (float)tp.position.y, (float)tp.position.z});
@@ -1174,12 +1428,23 @@ int main(int argc, char** argv) {
                                 }
                             }
                         }
-                        if (best_tag_id >= 0) break;
+                    }
+
+                    // Time budget check inside orbit loop
+                    auto orbit_now = std::chrono::system_clock::now();
+                    secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                        orbit_now - start_time).count();
+                    if ((300 - (int)secondsElapsed) < Config::TIME_RESERVE_SECONDS) {
+                        RCLCPP_WARN(node->get_logger(),
+                            "[%lus] Running low on time during orbit. Breaking.",
+                            secondsElapsed);
+                        break;
                     }
                 }
+
                 if (best_tag_id < 0) {
                     RCLCPP_WARN(node->get_logger(),
-                        "[%lus] No AprilTag found after full 360° spin at box %d.",
+                        "[%lus] No AprilTag found after costmap orbit at box %d. Moving on.",
                         secondsElapsed, current_box_index);
                 }
             }
@@ -1209,7 +1474,7 @@ int main(int argc, char** argv) {
             RCLCPP_INFO(node->get_logger(), "*** MATCH FOUND! '%s' == '%s' ***",
                         scene_object_name.c_str(), manipulable_object_name.c_str());
             
-            // AprilTag was already searched above (immediate + 360° spin).
+            // AprilTag was already searched above (immediate + costmap orbit).
             // Use whatever was found — no need to spin again.
             if (best_tag_id < 0) {
                 RCLCPP_WARN(node->get_logger(), "[%lus] No AprilTag was found at this box. Cannot align for drop.", secondsElapsed);

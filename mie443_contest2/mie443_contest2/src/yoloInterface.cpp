@@ -71,7 +71,10 @@ bool YoloInterface::captureAndDetect(CameraSource camera, bool save_image) {
     detect_request->image = capture_response->image;
     
     // Assign the boolean to the service request
-    detect_request->save_detected_image = save_image; 
+    detect_request->save_detected_image = save_image;
+
+    // Wrist camera is mounted upside-down — tell YOLO to flip 180°
+    detect_request->flip_image = (camera == CameraSource::WRIST); 
     
     auto detect_future = detect_client_->async_send_request(detect_request);
 

@@ -286,7 +286,7 @@ if [ "$NO_ARM" = false ]; then
 
     # Verify Pi services are visible from laptop
     echo "=== Verifying Pi MoveIt ==="
-    if ! check_local_action "/move_action" 15; then
+    if ! check_local_action "/move_group" 15; then
         echo "[WARN] MoveIt action not detected. Check Pi terminal."
         read -p "  Press ENTER to continue anyway, or Ctrl+C to abort..."
     fi
@@ -309,7 +309,7 @@ if [ "$NO_ARM" = false ]; then
 
     echo "=== Launching YOLO Detector ==="
     launch_terminal "YOLO Detector" \
-        "ros2 run mie443_contest2 yolo_detector.py"
+        "ros2 run mie443_contest2 yolo_detector"
     sleep 3
 
     echo "=== Camera Warm-Up ==="
@@ -345,7 +345,7 @@ else
 
     echo "=== Launching YOLO Detector ==="
     launch_terminal "YOLO Detector" \
-        "ros2 run mie443_contest2 yolo_detector.py"
+        "ros2 run mie443_contest2 yolo_detector"
     sleep 3
 
     echo "=== Camera Warm-Up ==="

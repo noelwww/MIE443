@@ -25,7 +25,7 @@ class YoloDetectorNode(Node):
         self.get_logger().info('YOLO model loaded')
         
         # Confidence threshold
-        self.confidence_threshold = 0.5
+        self.confidence_threshold = 0.25
 
         # Minimum bounding box area (in pixels) to accept a detection.
         # Rejects small detections of far-away objects that the robot is not near.
@@ -63,7 +63,12 @@ class YoloDetectorNode(Node):
             response.confidence = 0.0
             response.message = "Failed to decode image"
             return response
-        
+
+        # Flip 180° if requested (e.g. wrist camera mounted upside-down)
+        if request.flip_image:
+            image = cv2.rotate(image, cv2.ROTATE_180)
+            self.get_logger().info('Image flipped 180° (upside-down camera correction)')
+
         # Run YOLO inference
         results = self.model(image, verbose=False, device='cpu')
         boxes = results[0].boxes

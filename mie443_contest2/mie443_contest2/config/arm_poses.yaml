@@ -1,0 +1,48 @@
+# =============================================================================
+# MIE443 Contest 2 — Arm Pose Configuration
+# =============================================================================
+# Edit this file to change arm poses WITHOUT rebuilding the code.
+#
+# After editing, just re-run the contest — no colcon build needed!
+# The code searches for this file in order:
+#   1. ./arm_poses.yaml           (current working directory — highest priority)
+#   2. Installed share path       (via ament_index_cpp)
+#   3. Hardcoded defaults         (fallback if file not found)
+#
+# To calibrate: run  ./launch_all.sh --debug  → option 7 or 10
+# Then paste the printed joint values here.
+# =============================================================================
+
+# --- Joint-space targets (radians) ---
+# These bypass IK entirely — most reliable for the 5-DOF SO-ARM101.
+# Leave as empty list [] to fall back to Cartesian targets below.
+arm_look_joints:   [-1.70983, -0.730833172, 0.719931, 1.6410469858, 1.46864237]
+arm_pickup_joints: [-1.794406, -1.0182992, 1.1159992, 1.384434, 1.086024]
+arm_carry_joints:  [-1.800044, -1.4320071, 0.929259, 1.6438824, 1.0511085]
+arm_drop_joints:   [-0.1395492, 0.8129663, -1.20920725, 1.20863287, 1.080205]
+
+# --- Cartesian targets (x, y, z, qx, qy, qz, qw) ---
+# Used as fallback when joint values above are empty [].
+arm_look_cartesian:   [0.115049, 0.00866053, 0.182472, 0.0771996, 0.0283588, 0.996288, 0.025429]
+arm_pickup_cartesian: [0.103496, 0.00683864, 0.154764, 0.0100663, -0.0163231, -0.201975, 0.979203]
+arm_carry_cartesian:  [0.0636712, -0.0981863, 0.238941, 0.444479, 0.864106, 0.128399, -0.198173]
+arm_drop_cartesian:   [0.0243134, -0.242021, 0.259773, -0.153172, -0.174677, -0.720359, 0.653536]
+
+# --- Alignment Parameters ---
+desired_drop_distance: 0.4    # meters from AprilTag for drop
+distance_tolerance:    0.05   # meters
+angle_tolerance:       0.1    # radians
+
+# --- YOLO Detection ---
+yolo_max_retries: 4
+yolo_retry_delay: 0.8         # seconds
+
+# --- Scene Search Spin ---
+# After arriving at a box, if YOLO can't see anything, the robot
+# sweeps from -90° to +90° relative to its arrival heading.
+# total sweep = scene_spin_steps × scene_spin_step_deg
+scene_spin_steps:    9        # number of 20° increments
+scene_spin_step_deg: 20       # degrees per step
+
+# --- Time Budget ---
+time_reserve_seconds: 30      # seconds reserved to return home

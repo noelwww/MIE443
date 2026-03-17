@@ -4,6 +4,7 @@
 # Request
 sensor_msgs/CompressedImage image
 bool save_detected_image    # Whether to save the detected image to disk
+bool flip_image             # Rotate image 180° before detection (for upside-down cameras)
 
 ---
 
