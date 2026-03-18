@@ -80,9 +80,9 @@ namespace Config {
     // How far from the robot to search for obstacle clusters on the costmap (m)
     double ORBIT_SEARCH_RADIUS = 1.5;
     // Distance from obstacle centroid to place orbit viewpoints (m)
-    double ORBIT_RADIUS = 0.55;
+    double ORBIT_RADIUS = 0.80;
     // Number of evenly-spaced candidate viewpoints around the obstacle
-    int ORBIT_NUM_VIEWPOINTS = 12;
+    int ORBIT_NUM_VIEWPOINTS = 6;
     // Max obstacle area to classify as a "bin" (m²); larger = wall
     double ORBIT_MAX_BIN_AREA = 0.5;
     // Costmap cost threshold: cells >= this are considered blocked (0-100 scale)
@@ -92,7 +92,7 @@ namespace Config {
     // If all viewpoints are blocked, retry at this fraction of orbit_radius
     double ORBIT_FALLBACK_RADIUS_RATIO = 0.7;
     // Navigation timeout for each orbit viewpoint move (s)
-    double ORBIT_VIEWPOINT_TIMEOUT = 10.0;
+    double ORBIT_VIEWPOINT_TIMEOUT = 3.0;
 
     // --- Time Budget ---
     int TIME_RESERVE_SECONDS = 45;
@@ -1238,172 +1238,67 @@ int main(int argc, char** argv) {
             // often returns a stale cached frame.
             std::this_thread::sleep_for(std::chrono::seconds(2));
             
-            RCLCPP_INFO(node->get_logger(), "[%lus] Detecting scene object...", secondsElapsed);
-            
-            // Detect scene object using the front-facing OAK-D camera (with retries)
+            RCLCPP_INFO(node->get_logger(), "[%lus] Starting costmap orbit for scene object and AprilTag detection...", secondsElapsed);
+
+            // Variables to accumulate detections across all orbit viewpoints
             std::string scene_object_name;
-            for (int attempt = 1; attempt <= Config::YOLO_MAX_RETRIES; ++attempt) {
-                scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                if (!scene_object_name.empty()) break;
-                if (attempt < Config::YOLO_MAX_RETRIES) {
-                    RCLCPP_WARN(node->get_logger(), "[%lus] OAK-D attempt %d/%d empty. Retrying...",
-                                secondsElapsed, attempt, Config::YOLO_MAX_RETRIES);
-                    std::this_thread::sleep_for(std::chrono::duration<double>(Config::YOLO_RETRY_DELAY));
-                }
-            }
-            
-            // If still nothing, sweep ±90° from arrival heading to search.
-            // The object is known to be within 180° of the arrival heading.
-            // Strategy: rotate to -90° first, then sweep forward in 20° steps.
-            if (scene_object_name.empty()) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object after %d retries. Sweeping ±90° to search...",
-                            secondsElapsed, Config::YOLO_MAX_RETRIES);
-
-                // Save arrival heading so we can compute absolute targets
-                float arrival_phi = phi;
-
-                // Step 1: Rotate to -90° from arrival heading
-                float start_phi = arrival_phi - M_PI / 2.0;
-                while (start_phi > M_PI) start_phi -= 2.0 * M_PI;
-                while (start_phi < -M_PI) start_phi += 2.0 * M_PI;
-
-                RCLCPP_INFO(node->get_logger(), "[%lus] Rotating to -90° (%.1fdeg) to start sweep...",
-                            secondsElapsed, start_phi * 180.0 / M_PI);
-                nav.moveToGoal(robotPose.x, robotPose.y, start_phi, 10.0);
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-
-                // Try detection at -90° position
-                scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                if (!scene_object_name.empty()) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found at -90°!", secondsElapsed);
-                }
-
-                // Step 2: Sweep from -90° to +90° in 20° steps
-                if (scene_object_name.empty()) {
-                    for (int spin_step = 1; spin_step <= Config::SCENE_SPIN_STEPS; ++spin_step) {
-                        float target_phi = start_phi + spin_step * Config::SCENE_SPIN_INCREMENT;
-                        while (target_phi > M_PI) target_phi -= 2.0 * M_PI;
-                        while (target_phi < -M_PI) target_phi += 2.0 * M_PI;
-
-                        RCLCPP_INFO(node->get_logger(), "[%lus] Sweep step %d/%d → %.1fdeg...",
-                                    secondsElapsed, spin_step, Config::SCENE_SPIN_STEPS,
-                                    target_phi * 180.0 / M_PI);
-
-                        nav.moveToGoal(robotPose.x, robotPose.y, target_phi, 10.0);
-
-                        // Settle and detect
-                        std::this_thread::sleep_for(std::chrono::milliseconds(800));
-
-                        scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                        if (!scene_object_name.empty()) {
-                            RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found at sweep step %d!",
-                                        secondsElapsed, spin_step);
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            if (scene_object_name.empty()) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object detected at box %d.", secondsElapsed, current_box_index);
-                continue;
-            }
-            
-            RCLCPP_INFO(node->get_logger(), "[%lus] Detected scene object: '%s' at box %d",
-                        secondsElapsed, scene_object_name.c_str(), current_box_index);
-            detected_scene_objects.push_back({scene_object_name, {x, y, phi}});
-            
-            // *** Try to scan for AprilTag immediately (might be visible from current angle) ***
-            // NOTE: The AprilTag is on the BIN, facing a specific direction.
-            // It may NOT be visible from the same angle as the object — tag could be
-            // on the far side of the bin. If not visible here, we spin to find it.
-            RCLCPP_INFO(node->get_logger(), "[%lus] Checking for AprilTag from current angle...",
-                        secondsElapsed);
-            auto visible_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
             int best_tag_id = -1;
             float best_tag_dist = 0.0f;
             float best_tag_angle = 0.0f;
-            
-            if (!visible_tags.empty()) {
-                for (int tid : visible_tags) {
-                    auto tp_opt = tag_detector->getTagPose(tid);
-                    if (tp_opt.has_value()) {
-                        auto& tp = tp_opt.value();
-                        float dist = std::sqrt(tp.position.x * tp.position.x +
-                                               tp.position.y * tp.position.y);
-                        float angle = std::atan2(tp.position.y, tp.position.x);
+
+            // --- Step 1: Find the nearest obstacle cluster (the bin) ---
+            double obs_cx, obs_cy;
+            bool obs_found = nav.findNearestObstacle(
+                robotPose.x, robotPose.y, obs_cx, obs_cy,
+                Config::ORBIT_SEARCH_RADIUS, x, y,
+                Config::ORBIT_MAX_BIN_AREA, Config::ORBIT_COST_THRESHOLD);
+
+            RCLCPP_INFO(node->get_logger(),
+                "[%lus] Obstacle centroid: (%.2f, %.2f) [%s]",
+                secondsElapsed, obs_cx, obs_cy,
+                obs_found ? "costmap" : "fallback=coords.xml");
+
+            // --- Step 2: Generate orbit viewpoints (clockwise from robot's arrival angle) ---
+            auto viewpoints = nav.generateViewpoints(
+                obs_cx, obs_cy, robotPose.x, robotPose.y,
+                Config::ORBIT_RADIUS, Config::ORBIT_NUM_VIEWPOINTS,
+                Config::ORBIT_ROBOT_RADIUS, Config::ORBIT_FALLBACK_RADIUS_RATIO);
+
+            RCLCPP_INFO(node->get_logger(),
+                "[%lus] %zu orbit viewpoints generated around (%.2f, %.2f).",
+                secondsElapsed, viewpoints.size(), obs_cx, obs_cy);
+
+            // --- Step 3: Visit viewpoints, detect BOTH scene object and AprilTag at each ---
+            for (size_t vp_idx = 0;
+                 vp_idx < viewpoints.size() && (scene_object_name.empty() || best_tag_id < 0);
+                 ++vp_idx) {
+                auto& vp = viewpoints[vp_idx];
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] Orbit viewpoint %zu/%zu → (%.2f, %.2f, %.1fdeg)",
+                    secondsElapsed, vp_idx + 1, viewpoints.size(),
+                    vp.x, vp.y, vp.yaw * 180.0 / M_PI);
+
+                if (!nav.moveToGoal(vp.x, vp.y, vp.yaw, Config::ORBIT_VIEWPOINT_TIMEOUT)) {
+                    RCLCPP_WARN(node->get_logger(),
+                        "[%lus] Failed to reach viewpoint %zu. Trying next.",
+                        secondsElapsed, vp_idx + 1);
+                    continue;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+                // YOLO scene-object detection (keep first successful result)
+                if (scene_object_name.empty()) {
+                    std::string detected_obj = yolo.getObjectName(CameraSource::OAKD, true);
+                    if (!detected_obj.empty()) {
+                        scene_object_name = detected_obj;
                         RCLCPP_INFO(node->get_logger(),
-                            "[%lus] [AprilTag] ID=%d | dist=%.3fm | angle=%.1fdeg | "
-                            "pos=(%.3f, %.3f, %.3f)",
-                            secondsElapsed, tid, dist, angle * 180.0 / M_PI,
-                            tp.position.x, tp.position.y, tp.position.z);
-                        detected_apriltags.push_back({current_box_index, tid, dist,
-                            angle * 180.0f / (float)M_PI,
-                            (float)tp.position.x, (float)tp.position.y, (float)tp.position.z});
-                        if (best_tag_id < 0) {
-                            best_tag_id = tid;
-                            best_tag_dist = dist;
-                            best_tag_angle = angle;
-                        }
-                    } else {
-                        RCLCPP_INFO(node->get_logger(),
-                            "[%lus] [AprilTag] ID=%d in TF but pose expired.",
-                            secondsElapsed, tid);
+                            "[%lus] Scene object '%s' detected at orbit viewpoint %zu.",
+                            secondsElapsed, scene_object_name.c_str(), vp_idx + 1);
                     }
                 }
-            } else {
-                RCLCPP_INFO(node->get_logger(),
-                    "[%lus] [AprilTag] Not visible from current angle. Tag may be on other side of bin.",
-                    secondsElapsed);
-            }
-            
-            // If no tag seen yet, use costmap orbit to view the bin from multiple angles.
-            // The tag faces one direction only — the orbit places the robot at viewpoints
-            // around the nearest obstacle (the bin) so it can check each face.
-            if (best_tag_id < 0) {
-                RCLCPP_INFO(node->get_logger(),
-                    "[%lus] AprilTag not visible. Starting costmap orbit search...",
-                    secondsElapsed);
 
-                // --- Step 1: Find the nearest obstacle cluster (the bin) ---
-                double obs_cx, obs_cy;
-                bool obs_found = nav.findNearestObstacle(
-                    robotPose.x, robotPose.y, obs_cx, obs_cy,
-                    Config::ORBIT_SEARCH_RADIUS, x, y,
-                    Config::ORBIT_MAX_BIN_AREA, Config::ORBIT_COST_THRESHOLD);
-
-                RCLCPP_INFO(node->get_logger(),
-                    "[%lus] Obstacle centroid: (%.2f, %.2f) [%s]",
-                    secondsElapsed, obs_cx, obs_cy,
-                    obs_found ? "costmap" : "fallback=coords.xml");
-
-                // --- Step 2: Generate orbit viewpoints ---
-                auto viewpoints = nav.generateViewpoints(
-                    obs_cx, obs_cy, robotPose.x, robotPose.y,
-                    Config::ORBIT_RADIUS, Config::ORBIT_NUM_VIEWPOINTS,
-                    Config::ORBIT_ROBOT_RADIUS, Config::ORBIT_FALLBACK_RADIUS_RATIO);
-
-                RCLCPP_INFO(node->get_logger(),
-                    "[%lus] %zu orbit viewpoints generated around (%.2f, %.2f).",
-                    secondsElapsed, viewpoints.size(), obs_cx, obs_cy);
-
-                // --- Step 3: Visit viewpoints, check AprilTag at each ---
-                for (size_t vp_idx = 0; vp_idx < viewpoints.size() && best_tag_id < 0; ++vp_idx) {
-                    auto& vp = viewpoints[vp_idx];
-                    RCLCPP_INFO(node->get_logger(),
-                        "[%lus] Orbit viewpoint %zu/%zu → (%.2f, %.2f, %.1fdeg)",
-                        secondsElapsed, vp_idx + 1, viewpoints.size(),
-                        vp.x, vp.y, vp.yaw * 180.0 / M_PI);
-
-                    if (!nav.moveToGoal(vp.x, vp.y, vp.yaw, Config::ORBIT_VIEWPOINT_TIMEOUT)) {
-                        RCLCPP_WARN(node->get_logger(),
-                            "[%lus] Failed to reach viewpoint %zu. Trying next.",
-                            secondsElapsed, vp_idx + 1);
-                        continue;
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-                    // Check for AprilTag
+                // AprilTag detection (keep first successful result)
+                if (best_tag_id < 0) {
                     auto orbit_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
                     if (!orbit_tags.empty()) {
                         for (int tid : orbit_tags) {
@@ -1429,24 +1324,35 @@ int main(int argc, char** argv) {
                             }
                         }
                     }
-
-                    // Time budget check inside orbit loop
-                    auto orbit_now = std::chrono::system_clock::now();
-                    secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                        orbit_now - start_time).count();
-                    if ((300 - (int)secondsElapsed) < Config::TIME_RESERVE_SECONDS) {
-                        RCLCPP_WARN(node->get_logger(),
-                            "[%lus] Running low on time during orbit. Breaking.",
-                            secondsElapsed);
-                        break;
-                    }
                 }
 
-                if (best_tag_id < 0) {
+                // Time budget check inside orbit loop
+                auto orbit_now = std::chrono::system_clock::now();
+                secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    orbit_now - start_time).count();
+                if ((300 - (int)secondsElapsed) < Config::TIME_RESERVE_SECONDS) {
                     RCLCPP_WARN(node->get_logger(),
-                        "[%lus] No AprilTag found after costmap orbit at box %d. Moving on.",
-                        secondsElapsed, current_box_index);
+                        "[%lus] Running low on time during orbit. Breaking.",
+                        secondsElapsed);
+                    break;
                 }
+            }
+
+            if (scene_object_name.empty()) {
+                RCLCPP_WARN(node->get_logger(),
+                    "[%lus] No scene object detected at box %d after orbit. Moving on.",
+                    secondsElapsed, current_box_index);
+                continue;
+            }
+
+            RCLCPP_INFO(node->get_logger(), "[%lus] Detected scene object: '%s' at box %d",
+                        secondsElapsed, scene_object_name.c_str(), current_box_index);
+            detected_scene_objects.push_back({scene_object_name, {x, y, phi}});
+
+            if (best_tag_id < 0) {
+                RCLCPP_WARN(node->get_logger(),
+                    "[%lus] No AprilTag found after costmap orbit at box %d. Moving on.",
+                    secondsElapsed, current_box_index);
             }
             
             // In no-arm mode, log everything and move on

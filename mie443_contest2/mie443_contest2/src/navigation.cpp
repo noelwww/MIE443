@@ -619,12 +619,22 @@ std::vector<Navigation::Viewpoint> Navigation::generateViewpoints(
 		}
 	}
 
-	// Sort by distance from robot (nearest first)
+	// Sort clockwise starting from the robot's current angle relative to the obstacle.
+	// "Clockwise" means decreasing angle (right-hand turn when facing the obstacle).
+	// normalizeAngle(robot_angle - vp_angle) in [0, 2π) gives ascending clockwise offset.
+	double robot_angle = std::atan2(robot_y - obs_y, robot_x - obs_x);
+	auto normalizeClockwise = [](double a) -> double {
+		// Wrap angle into [0, 2π) using fmod for efficiency
+		a = std::fmod(a, 2.0 * M_PI);
+		if (a < 0.0) a += 2.0 * M_PI;
+		return a;
+	};
 	std::sort(viewpoints.begin(), viewpoints.end(),
-		[robot_x, robot_y](const Viewpoint& a, const Viewpoint& b) {
-			double da = (a.x - robot_x) * (a.x - robot_x) + (a.y - robot_y) * (a.y - robot_y);
-			double db = (b.x - robot_x) * (b.x - robot_x) + (b.y - robot_y) * (b.y - robot_y);
-			return da < db;
+		[obs_x, obs_y, robot_angle, normalizeClockwise](const Viewpoint& a, const Viewpoint& b) {
+			double angle_a = std::atan2(a.y - obs_y, a.x - obs_x);
+			double angle_b = std::atan2(b.y - obs_y, b.x - obs_x);
+			return normalizeClockwise(robot_angle - angle_a) <
+			       normalizeClockwise(robot_angle - angle_b);
 		});
 
 	RCLCPP_INFO(node_->get_logger(),
