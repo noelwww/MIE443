@@ -46,11 +46,11 @@ public:
 
 	/// Generate orbit viewpoints around an obstacle centroid.
 	/// Each viewpoint faces toward (obs_x, obs_y) and is verified to be in free space.
-	/// Sorted by angular distance from current robot heading, then by proximity.
+	/// Sorted clockwise (left-first) from the robot's current angle relative to the obstacle.
 	std::vector<Viewpoint> generateViewpoints(double obs_x, double obs_y,
 	                                          double robot_x, double robot_y,
-	                                          double orbit_radius = 0.55,
-	                                          int num_candidates = 12,
+	                                          double orbit_radius = 0.80,
+	                                          int num_candidates = 6,
 	                                          double robot_radius = 0.22,
 	                                          double fallback_radius_ratio = 0.7);
 
