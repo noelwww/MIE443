@@ -82,7 +82,7 @@ namespace Config {
     // Distance from obstacle centroid to place orbit viewpoints (m)
     double ORBIT_RADIUS = 0.80;
     // Number of evenly-spaced candidate viewpoints around the obstacle
-    int ORBIT_NUM_VIEWPOINTS = 6;
+    int ORBIT_NUM_VIEWPOINTS = 9;
     // Max obstacle area to classify as a "bin" (m²); larger = wall
     double ORBIT_MAX_BIN_AREA = 0.5;
     // Costmap cost threshold: cells >= this are considered blocked (0-100 scale)
