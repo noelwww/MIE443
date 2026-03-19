@@ -14,12 +14,12 @@
 # If arm IS used, start these on the Pi BEFORE running this script:
 #
 #   Terminal 1 (Pi — MoveIt):
-#     ssh ubuntu@100.69.127.190
+#     ssh ubuntu@100.69.127.175
 #     source contest2/bin/activate
 #     ros2 launch lerobot_moveit so101_turtlebot.launch.py
 #
 #   Terminal 2 (Pi — Image Capture Server):
-#     ssh ubuntu@100.69.127.190
+#     ssh ubuntu@100.69.127.175
 #     cd ~/ros2_ws && colcon build --packages-select mie443_contest2
 #     source install/setup.bash
 #     source contest2/bin/activate
@@ -136,6 +136,57 @@ cleanup() {
     exit 0
 }
 trap cleanup SIGINT SIGTERM
+
+# ---- Pi SSH configuration ----
+PI_HOST="ubuntu@100.69.127.175"
+PI_WS="/home/ubuntu/ros2_ws"
+
+# ---- Utility: auto-start image_capture_server on Pi via SSH ----
+auto_start_pi_image_capture() {
+    echo "[INFO] Attempting to auto-start image_capture_server on Pi ($PI_HOST)..."
+    # Check SSH connectivity first (2s timeout)
+    if ! ssh -o ConnectTimeout=3 -o BatchMode=yes "$PI_HOST" "echo ok" &>/dev/null; then
+        echo "[WARN] Cannot SSH into Pi ($PI_HOST). Is it powered on?"
+        echo "       Check: ssh $PI_HOST"
+        return 1
+    fi
+    # Kill any existing image_capture_server (stale process)
+    ssh -o ConnectTimeout=3 "$PI_HOST" "pkill -f image_capture_server" 2>/dev/null || true
+    sleep 1
+    # Start image_capture_server in background via SSH
+    ssh -o ConnectTimeout=3 "$PI_HOST" "
+        source $PI_WS/install/setup.bash && \
+        source ~/contest2/bin/activate 2>/dev/null; \
+        nohup ros2 run mie443_contest2 image_capture_server > /tmp/image_capture_server.log 2>&1 &
+        echo \"[Pi] image_capture_server started (PID: \$!)\"
+    "
+    echo "[INFO] Waiting for image_capture_server to initialize..."
+    sleep 5
+    return 0
+}
+
+# ---- Utility: ensure image_capture_server is running, auto-start if not ----
+ensure_image_capture_server() {
+    local max_attempts=3
+    local attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        echo "=== Checking Image Capture Server (attempt $attempt/$max_attempts) ==="
+        if check_local_service "/oakd_camera/capture_image" 10; then
+            return 0
+        fi
+        echo "[INFO] Service not found. Trying to auto-start on Pi..."
+        auto_start_pi_image_capture
+        if check_local_service "/oakd_camera/capture_image" 15; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+    done
+    echo "[WARN] Image Capture Server not available after $max_attempts attempts."
+    echo "       Manually start on Pi: ros2 run mie443_contest2 image_capture_server"
+    echo "       Pi log: ssh $PI_HOST cat /tmp/image_capture_server.log"
+    read -p "  Press ENTER to continue anyway, or Ctrl+C to abort..."
+    return 1
+}
 
 # ---- Utility: wait for a local ROS2 service ----
 check_local_service() {
@@ -278,7 +329,7 @@ if [ "$NO_ARM" = false ]; then
     echo "=========================================="
     echo ""
     echo "  Confirm that these are running on the Pi:"
-    echo "    1. ros2 launch lerobot_moveit so101_turtlebot.launch.py"
+    echo "    1. ros2 launch lerobot_moveit so101_turtlebot.launch.py  (add port:=/dev/ttyACM1 if needed)"
     echo "    2. ros2 run mie443_contest2 image_capture_server"
     echo ""
     read -p "  Press ENTER to confirm Pi services are running..."
@@ -286,16 +337,13 @@ if [ "$NO_ARM" = false ]; then
 
     # Verify Pi services are visible from laptop
     echo "=== Verifying Pi MoveIt ==="
-    if ! check_local_action "/move_group" 15; then
+    if ! check_local_action "/move_group" 3; then
         echo "[WARN] MoveIt action not detected. Check Pi terminal."
         read -p "  Press ENTER to continue anyway, or Ctrl+C to abort..."
     fi
 
     echo "=== Verifying Pi Image Capture Server ==="
-    if ! check_local_service "/oakd_camera/capture_image" 10; then
-        echo "[WARN] Image Capture Server not detected. Check Pi terminal."
-        read -p "  Press ENTER to continue anyway, or Ctrl+C to abort..."
-    fi
+    ensure_image_capture_server
 
     echo "=== Launching MoveIt (Laptop side) ==="
     launch_terminal "MoveIt Laptop" \
@@ -322,21 +370,11 @@ else
     echo "=========================================="
     echo ""
     echo "  The OAK-D camera is still needed for object detection."
-    echo "  Start the Image Capture Server on the Pi:"
-    echo ""
-    echo "    ssh ubuntu@100.69.127.190"
-    echo "    cd ~/ros2_ws && source install/setup.bash"
-    echo "    source ~/contest2/bin/activate"
-    echo "    ros2 run mie443_contest2 image_capture_server"
-    echo ""
-    read -p "  Press ENTER once Image Capture Server is running on Pi..."
+    echo "  Will auto-start image_capture_server on Pi via SSH..."
     echo ""
 
-    echo "=== Verifying Pi Image Capture Server ==="
-    if ! check_local_service "/oakd_camera/capture_image" 15; then
-        echo "[WARN] Image Capture Server not detected. Object detection will fail."
-        read -p "  Press ENTER to continue anyway, or Ctrl+C to abort..."
-    fi
+    echo "=== Verifying/Starting Pi Image Capture Server ==="
+    ensure_image_capture_server
 
     echo "=== Launching AprilTag Detector ==="
     launch_terminal "AprilTag Detector" \

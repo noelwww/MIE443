@@ -1,11 +1,18 @@
 === CONTEST 2 RESULTS ===
-Mode: FULL (with arm)
-Manipulable Object: cup
-Object Placed: NO
+Mode: NAV-ONLY (no arm)
+Manipulable Object: N/A (no-arm mode)
+Object Placed: N/A
 Boxes Visited: 5/5
 
 Detected Scene Objects:
+  1. Object: cup at (x=-0.0608, y=-2.33, phi=1.74846e-07)
+  2. Object: bottle at (x=0.477, y=-1.04, phi=0.0497107)
+  3. Object: potted plant at (x=-0.975, y=1.26, phi=0.614663)
+  4. Object: motorcycle at (x=-3.82, y=-0.355, phi=-2.45928)
 
-AprilTag Detections: NONE
+AprilTag Detections:
+  Box 4: Tag ID=4 | dist=0.209443m | angle=5.5501deg | pos=(0.208461, 0.0202565, 0.140978)
+  Box 0: Tag ID=3 | dist=0.158931m | angle=-21.6041deg | pos=(0.147766, -0.058517, 0.139759)
+  Box 2: Tag ID=0 | dist=0.176167m | angle=-15.0115deg | pos=(0.170155, -0.0456294, 0.138107)
 
-Time Elapsed: 133 seconds
+Time Elapsed: 296 seconds
