@@ -300,9 +300,20 @@ echo "=== Launching AMCL Localization ==="
 launch_terminal "AMCL Localization" \
     "ros2 launch turtlebot4_navigation localization.launch.py map:=$MAP_FILE"
 
-echo "=== Launching Nav2 Navigation ==="
-launch_terminal "Nav2 Navigation" \
-    "ros2 launch turtlebot4_navigation nav2.launch.py"
+echo "=== Launching Nav2 Navigation (custom params) ==="
+NAV2_PARAMS="$SCRIPT_DIR/config/nav2.yaml"
+if [ ! -f "$NAV2_PARAMS" ]; then
+    echo "[WARN] Custom nav2.yaml not found at $NAV2_PARAMS"
+    echo "       Falling back to default turtlebot4_navigation params."
+    NAV2_PARAMS=""
+fi
+if [ -n "$NAV2_PARAMS" ]; then
+    launch_terminal "Nav2 Navigation" \
+        "ros2 launch turtlebot4_navigation nav2.launch.py params_file:=$NAV2_PARAMS"
+else
+    launch_terminal "Nav2 Navigation" \
+        "ros2 launch turtlebot4_navigation nav2.launch.py"
+fi
 
 echo "=== Launching RViz ==="
 launch_terminal "RViz" \
@@ -350,6 +361,10 @@ if [ "$NO_ARM" = false ]; then
         "ros2 launch lerobot_moveit so101_laptop.launch.py"
     sleep 5
 
+    echo "=== Camera Warm-Up (before AprilTag so images are flowing) ==="
+    start_and_verify_camera
+    echo ""
+
     echo "=== Launching AprilTag Detector ==="
     launch_terminal "AprilTag Detector" \
         "ros2 launch mie443_contest2 apriltag_oakd.launch.py"
@@ -360,9 +375,6 @@ if [ "$NO_ARM" = false ]; then
         "ros2 run mie443_contest2 yolo_detector"
     sleep 3
 
-    echo "=== Camera Warm-Up ==="
-    start_and_verify_camera
-    echo ""
 
 else
     echo "=========================================="
@@ -376,6 +388,10 @@ else
     echo "=== Verifying/Starting Pi Image Capture Server ==="
     ensure_image_capture_server
 
+    echo "=== Camera Warm-Up (before AprilTag so images are flowing) ==="
+    start_and_verify_camera
+    echo ""
+
     echo "=== Launching AprilTag Detector ==="
     launch_terminal "AprilTag Detector" \
         "ros2 launch mie443_contest2 apriltag_oakd.launch.py"
@@ -386,9 +402,6 @@ else
         "ros2 run mie443_contest2 yolo_detector"
     sleep 3
 
-    echo "=== Camera Warm-Up ==="
-    start_and_verify_camera
-    echo ""
 fi
 
 # =============================================================================

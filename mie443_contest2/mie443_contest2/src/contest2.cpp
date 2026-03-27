@@ -49,7 +49,7 @@ namespace Config {
     float ARM_DROP_QX = -0.153172f;  float ARM_DROP_QY = -0.174677f;   float ARM_DROP_QZ = -0.720359f;  float ARM_DROP_QW = 0.653536f;
 
     // --- Alignment Parameters ---
-    float DESIRED_DROP_DISTANCE = 0.2f;
+    float DESIRED_DROP_DISTANCE = 0.1f;
     float DISTANCE_TOLERANCE = 0.05f;
     float ANGLE_TOLERANCE = 0.1f;
 
@@ -64,7 +64,7 @@ namespace Config {
 
     // --- YOLO Detection Parameters ---
     int YOLO_MAX_RETRIES = 4;
-    double YOLO_RETRY_DELAY = 1.0;
+    double YOLO_RETRY_DELAY = 0.8;
 
     // --- Scene Object Search Spin Parameters ---
     // Sweep ±90° from arrival heading: 9 steps × 20° = 180° total
@@ -73,11 +73,14 @@ namespace Config {
     float SCENE_SPIN_INCREMENT = M_PI / 9.0;
     double SCENE_SPIN_DURATION = SCENE_SPIN_INCREMENT / SPIN_ANGULAR_VEL;
 
-    // --- Standoff Distance ---
-    const float STANDOFF_DISTANCE = 0.5;
 
     // --- Time Budget ---
     int TIME_RESERVE_SECONDS = 45;
+
+    // --- Navigation Tuning (per-goal) ---
+    double NAV_TIMEOUT_MAX = 45.0;          // seconds — max time per moveToGoal
+    double ALIGNMENT_XY_TOLERANCE = 0.05;   // meters — tight tolerance for alignment moves
+    double FORWARD_DRIVE_BEFORE_DROP = 0.20; // meters — fixed forward drive after facing bin, before dropping
 
     // Path to the YAML file that was actually loaded (empty = defaults)
     std::string loaded_yaml_path = "";
@@ -947,13 +950,23 @@ int main(int argc, char** argv) {
     // IMPORTANT: AMCL publishes /amcl_pose with transient_local durability (latched).
     // We MUST use transient_local on the subscriber too, otherwise we miss the
     // already-published pose and the 10s wait loop times out.
+
+
+
     RobotPose robotPose(0, 0, 0);
     auto amcl_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+
+
     auto amclSub = node->create_subscription<geometry_msgs::msg::PoseWithCovarianceStamped>(
         "/amcl_pose",
         amcl_qos,
         std::bind(&RobotPose::poseCallback, &robotPose, std::placeholders::_1)
     );
+
+
+
+
+
 
     // Initialize box coordinates
     Boxes boxes;
@@ -1017,7 +1030,15 @@ int main(int argc, char** argv) {
     // State tracking (regular variables, not static)
     bool initialized = false;
     std::string manipulable_object_name = "";
-    std::vector<std::pair<std::string, std::vector<float>>> detected_scene_objects;
+    float manipulable_confidence = -1.0f;  // -1 = not detected (defaulted)
+    // Scene detection data: object name, confidence, predefined box coords, robot pose at detection
+    struct SceneDetection {
+        std::string name;
+        float confidence;      // YOLO confidence (-1 if unavailable)
+        float box_x, box_y, box_phi;    // predefined coordinates from coords.xml
+        float robot_x, robot_y, robot_phi;  // robot pose when detection was made
+    };
+    std::vector<SceneDetection> detected_scene_objects;
     // AprilTag diagnostic data: {box_index, tag_id, distance, angle_deg, x, y, z}
     struct AprilTagInfo { int box_idx; int tag_id; float dist; float angle_deg; float x; float y; float z; };
     std::vector<AprilTagInfo> detected_apriltags;
@@ -1089,8 +1110,9 @@ int main(int argc, char** argv) {
                 // true = save annotated image with bounding box
                 manipulable_object_name = yolo.getObjectName(CameraSource::WRIST, true);
                 if (!manipulable_object_name.empty()) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] Detected '%s' on attempt %d/%d (image saved)",
-                                secondsElapsed, manipulable_object_name.c_str(), attempt, Config::YOLO_MAX_RETRIES);
+                    manipulable_confidence = yolo.getConfidence();
+                    RCLCPP_INFO(node->get_logger(), "[%lus] Detected '%s' (conf=%.2f) on attempt %d/%d (image saved)",
+                                secondsElapsed, manipulable_object_name.c_str(), manipulable_confidence, attempt, Config::YOLO_MAX_RETRIES);
                     break;
                 }
                 if (attempt < Config::YOLO_MAX_RETRIES) {
@@ -1104,7 +1126,8 @@ int main(int argc, char** argv) {
                 RCLCPP_WARN(node->get_logger(), "[%lus] WARNING: No object detected after %d attempts.",
                             secondsElapsed, Config::YOLO_MAX_RETRIES);
                 manipulable_object_name = "cup";
-                RCLCPP_WARN(node->get_logger(), "[%lus] Defaulting to '%s'.", secondsElapsed, manipulable_object_name.c_str());
+                manipulable_confidence = -1.0f;  // defaulted, not actually detected
+                RCLCPP_WARN(node->get_logger(), "[%lus] Defaulting to '%s' (confidence: N/A).", secondsElapsed, manipulable_object_name.c_str());
             } else {
                 RCLCPP_INFO(node->get_logger(), "[%lus] *** Manipulable object: '%s' ***", secondsElapsed, manipulable_object_name.c_str());
             }
@@ -1204,44 +1227,131 @@ int main(int argc, char** argv) {
             RCLCPP_INFO(node->get_logger(), "[%lus] Robot current pose: x=%.2f, y=%.2f, phi=%.2f",
                         secondsElapsed, robotPose.x, robotPose.y, robotPose.phi);
             
-            // Time-aware timeout: never navigate longer than remaining contest time
-            double nav_timeout = std::max(10.0, (double)(300 - (int)secondsElapsed));
-            if (!nav.moveToGoal(x, y, phi, nav_timeout)) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] FAILED to reach box %d. Skipping.", 
+            // Per-goal timeout: capped so robot doesn't circle forever near one box.
+            // Also capped by remaining contest time (minimum 10s floor).
+            double nav_timeout = std::min(Config::NAV_TIMEOUT_MAX, std::max(10.0, (double)(300 - (int)secondsElapsed)));
+            bool nav_succeeded = nav.moveToGoal(x, y, phi, nav_timeout);
+            if (!nav_succeeded) {
+                RCLCPP_WARN(node->get_logger(), "[%lus] Navigation to box %d timed out/failed. Attempting backup recovery...", 
                             secondsElapsed, current_box_index);
-                continue;
+                // Back up 0.3m to escape costmap boundary / stuck situation, then retry
+                if (nav.backup(0.3, 0.1, 10.0)) {
+                    RCLCPP_INFO(node->get_logger(), "[%lus] Backup succeeded. Retrying navigation to box %d...",
+                                secondsElapsed, current_box_index);
+                    double retry_timeout = std::min(Config::NAV_TIMEOUT_MAX * 0.5, std::max(10.0, (double)(300 - (int)secondsElapsed)));
+                    nav_succeeded = nav.moveToGoal(x, y, phi, retry_timeout);
+                    if (!nav_succeeded) {
+                        RCLCPP_WARN(node->get_logger(), "[%lus] Retry navigation also failed. Treating as arrived — proceeding with detection.",
+                                    secondsElapsed);
+                    }
+                } else {
+                    RCLCPP_WARN(node->get_logger(), "[%lus] Backup failed. Treating as arrived — proceeding with detection.",
+                                secondsElapsed);
+                }
             }
             
             RCLCPP_INFO(node->get_logger(), "[%lus] Arrived at box %d (%.2f, %.2f, %.1fdeg). Taking 2 pictures...",
                         secondsElapsed, current_box_index, x, y, phi * 180.0 / M_PI);
             
-            // Take 2 OAK-D pictures from the arrival heading before any rotation
+            // Take 2 OAK-D pictures from the arrival heading — check for BOTH object and AprilTag
             std::string scene_object_name;
+            int best_tag_id = -1;
+            float best_tag_dist = 0.0f;
+            float best_tag_angle = 0.0f;
+
+            // Track the robot pose when the object was first detected
+            // (used as fallback heading if no AprilTag found)
+            float obj_detect_x = 0.0f, obj_detect_y = 0.0f, obj_detect_phi = 0.0f;
+            bool have_obj_detect_pose = false;
+
             for (int pic = 1; pic <= 2; ++pic) {
-                scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                if (!scene_object_name.empty()) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] OAK-D pic %d/2: detected '%s'",
-                                secondsElapsed, pic, scene_object_name.c_str());
-                    break;
+                // YOLO detection
+                if (scene_object_name.empty()) {
+                    scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
+                    if (!scene_object_name.empty()) {
+                        RCLCPP_INFO(node->get_logger(), "[%lus] OAK-D pic %d/2: detected '%s'",
+                                    secondsElapsed, pic, scene_object_name.c_str());
+                        if (!have_obj_detect_pose) {
+                            obj_detect_x = robotPose.x;
+                            obj_detect_y = robotPose.y;
+                            obj_detect_phi = robotPose.phi;
+                            have_obj_detect_pose = true;
+                        }
+                    } else {
+                        RCLCPP_INFO(node->get_logger(), "[%lus] OAK-D pic %d/2: no object.",
+                                    secondsElapsed, pic);
+                    }
                 }
-                RCLCPP_INFO(node->get_logger(), "[%lus] OAK-D pic %d/2: nothing detected.",
-                            secondsElapsed, pic);
-                if (pic < 2) {
+                // AprilTag detection
+                if (best_tag_id < 0) {
+                    auto visible_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
+                    for (int tid : visible_tags) {
+                        auto tp_opt = tag_detector->getTagPose(tid);
+                        if (tp_opt.has_value()) {
+                            auto& tp = tp_opt.value();
+                            float dist = std::sqrt(tp.position.x * tp.position.x +
+                                                   tp.position.y * tp.position.y);
+                            float angle = std::atan2(tp.position.y, tp.position.x);
+                            RCLCPP_INFO(node->get_logger(),
+                                "[%lus] [AprilTag] ID=%d | dist=%.3fm | angle=%.1fdeg",
+                                secondsElapsed, tid, dist, angle * 180.0 / M_PI);
+                            detected_apriltags.push_back({current_box_index, tid, dist,
+                                angle * 180.0f / (float)M_PI,
+                                (float)tp.position.x, (float)tp.position.y, (float)tp.position.z});
+                            if (best_tag_id < 0) {
+                                best_tag_id = tid;
+                                best_tag_dist = dist;
+                                best_tag_angle = angle;
+                            }
+                        }
+                    }
+                }
+                // Early exit if both found
+                if (!scene_object_name.empty() && best_tag_id >= 0) break;
+                if (pic < 2) std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+            
+            // If AprilTag visible but no object, take 2 extra OAK-D pictures
+            // Tag confirms we're at the right spot — give YOLO extra chances before spinning
+            if (scene_object_name.empty() && best_tag_id >= 0) {
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] AprilTag ID=%d visible but no object. Taking 2 extra pictures...",
+                    secondsElapsed, best_tag_id);
+                for (int extra = 1; extra <= 2; ++extra) {
                     std::this_thread::sleep_for(std::chrono::seconds(1));
+                    std::string obj = yolo.getObjectName(CameraSource::OAKD, true);
+                    if (!obj.empty()) {
+                        scene_object_name = obj;
+                        RCLCPP_INFO(node->get_logger(), "[%lus] Extra pic %d: detected '%s'!",
+                                    secondsElapsed, extra, obj.c_str());
+                        if (!have_obj_detect_pose) {
+                            obj_detect_x = robotPose.x;
+                            obj_detect_y = robotPose.y;
+                            obj_detect_phi = robotPose.phi;
+                            have_obj_detect_pose = true;
+                        }
+                        break;
+                    } else {
+                        RCLCPP_WARN(node->get_logger(), "[%lus] Extra pic %d: still no object.",
+                                    secondsElapsed, extra);
+                    }
                 }
             }
             
-            // If neither picture detected anything, spin in small steps and try again
-            if (scene_object_name.empty()) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object from arrival heading. Spinning to search...",
-                            secondsElapsed);
+            // If either is missing after 2 pictures, spin in small steps searching for BOTH
+            if (scene_object_name.empty() || best_tag_id < 0) {
+                RCLCPP_WARN(node->get_logger(), "[%lus] After 2 pics: object=%s, tag=%s. Spinning to search...",
+                            secondsElapsed,
+                            scene_object_name.empty() ? "NONE" : scene_object_name.c_str(),
+                            best_tag_id >= 0 ? ("ID=" + std::to_string(best_tag_id)).c_str() : "NONE");
+                
+                int object_found_step = -1;  // track which step found the object
                 
                 for (int spin_step = 1; spin_step <= Config::SCENE_SPIN_STEPS; ++spin_step) {
                     RCLCPP_INFO(node->get_logger(), "[%lus] Search spin step %d/%d (%.0f deg)...",
                                 secondsElapsed, spin_step, Config::SCENE_SPIN_STEPS,
                                 Config::SCENE_SPIN_INCREMENT * 180.0 / M_PI);
                     
-                    // Use Nav2 Spin behavior (properly controls the robot base)
                     if (!nav.spin(Config::SCENE_SPIN_INCREMENT)) {
                         RCLCPP_WARN(node->get_logger(), "[%lus] Nav2 Spin failed, using moveToGoal rotation...", secondsElapsed);
                         float new_phi = robotPose.phi + Config::SCENE_SPIN_INCREMENT;
@@ -1249,87 +1359,28 @@ int main(int argc, char** argv) {
                         while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
                         nav.moveToGoal(robotPose.x, robotPose.y, new_phi);
                     }
-                    
-                    // Settle and detect
                     std::this_thread::sleep_for(std::chrono::milliseconds(500));
                     
-                    scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
-                    if (!scene_object_name.empty()) {
-                        RCLCPP_INFO(node->get_logger(), "[%lus] Scene object found after spin step %d!",
-                                    secondsElapsed, spin_step);
-                        break;
-                    }
-                }
-            }
-            
-            if (scene_object_name.empty()) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No scene object detected at box %d.", secondsElapsed, current_box_index);
-                continue;
-            }
-            
-            RCLCPP_INFO(node->get_logger(), "[%lus] Detected scene object: '%s' at box %d",
-                        secondsElapsed, scene_object_name.c_str(), current_box_index);
-            detected_scene_objects.push_back({scene_object_name, {x, y, phi}});
-            
-            // *** Try to scan for AprilTag immediately (might be visible from current angle) ***
-            RCLCPP_INFO(node->get_logger(), "[%lus] Checking for AprilTag from current angle...",
-                        secondsElapsed);
-            auto visible_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
-            int best_tag_id = -1;
-            float best_tag_dist = 0.0f;
-            float best_tag_angle = 0.0f;
-            
-            if (!visible_tags.empty()) {
-                for (int tid : visible_tags) {
-                    auto tp_opt = tag_detector->getTagPose(tid);
-                    if (tp_opt.has_value()) {
-                        auto& tp = tp_opt.value();
-                        float dist = std::sqrt(tp.position.x * tp.position.x +
-                                               tp.position.y * tp.position.y);
-                        float angle = std::atan2(tp.position.y, tp.position.x);
-                        RCLCPP_INFO(node->get_logger(),
-                            "[%lus] [AprilTag] ID=%d | dist=%.3fm | angle=%.1fdeg | "
-                            "pos=(%.3f, %.3f, %.3f)",
-                            secondsElapsed, tid, dist, angle * 180.0 / M_PI,
-                            tp.position.x, tp.position.y, tp.position.z);
-                        detected_apriltags.push_back({current_box_index, tid, dist,
-                            angle * 180.0f / (float)M_PI,
-                            (float)tp.position.x, (float)tp.position.y, (float)tp.position.z});
-                        if (best_tag_id < 0) {
-                            best_tag_id = tid;
-                            best_tag_dist = dist;
-                            best_tag_angle = angle;
+                    bool tag_found_this_step = false;
+                    
+                    // Check for object
+                    if (scene_object_name.empty()) {
+                        scene_object_name = yolo.getObjectName(CameraSource::OAKD, true);
+                        if (!scene_object_name.empty()) {
+                            RCLCPP_INFO(node->get_logger(), "[%lus] Object '%s' found at spin step %d!",
+                                        secondsElapsed, scene_object_name.c_str(), spin_step);
+                            object_found_step = spin_step;
+                            if (!have_obj_detect_pose) {
+                                obj_detect_x = robotPose.x;
+                                obj_detect_y = robotPose.y;
+                                obj_detect_phi = robotPose.phi;
+                                have_obj_detect_pose = true;
+                            }
                         }
-                    } else {
-                        RCLCPP_INFO(node->get_logger(),
-                            "[%lus] [AprilTag] ID=%d in TF but pose expired.",
-                            secondsElapsed, tid);
                     }
-                }
-            } else {
-                RCLCPP_INFO(node->get_logger(),
-                    "[%lus] [AprilTag] Not visible from current angle. Tag may be on other side of bin.",
-                    secondsElapsed);
-            }
-            
-            // If no tag seen yet, spin 360° to find it (tag faces one direction only)
-            if (best_tag_id < 0) {
-                RCLCPP_INFO(node->get_logger(), "[%lus] Spinning 360° to search for AprilTag on bin...",
-                            secondsElapsed);
-                for (int spin_step = 1; spin_step <= Config::SPIN_STEPS; ++spin_step) {
-                    RCLCPP_INFO(node->get_logger(), "[%lus] AprilTag search spin %d/%d (%.0f deg)...",
-                                secondsElapsed, spin_step, Config::SPIN_STEPS,
-                                Config::SPIN_INCREMENT * 180.0 / M_PI);
-                    if (!nav.spin(Config::SPIN_INCREMENT)) {
-                        float new_phi = robotPose.phi + Config::SPIN_INCREMENT;
-                        while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
-                        while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
-                        nav.moveToGoal(robotPose.x, robotPose.y, new_phi);
-                    }
-                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-                    
-                    auto spin_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
-                    if (!spin_tags.empty()) {
+                    // Check for AprilTag
+                    if (best_tag_id < 0) {
+                        auto spin_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
                         for (int tid : spin_tags) {
                             auto tp_opt = tag_detector->getTagPose(tid);
                             if (tp_opt.has_value()) {
@@ -1347,18 +1398,115 @@ int main(int argc, char** argv) {
                                     best_tag_id = tid;
                                     best_tag_dist = dist;
                                     best_tag_angle = angle;
+                                    tag_found_this_step = true;
                                 }
                             }
                         }
-                        if (best_tag_id >= 0) break;
+                    }
+                    
+                    // If AprilTag was NEWLY found THIS step but no object yet,
+                    // take 2 extra pictures — the tag confirms this is a good angle
+                    if (scene_object_name.empty() && tag_found_this_step) {
+                        RCLCPP_INFO(node->get_logger(),
+                            "[%lus] Spin step %d: NEW AprilTag but no object. Taking 2 extra pictures...",
+                            secondsElapsed, spin_step);
+                        for (int extra = 1; extra <= 2; ++extra) {
+                            std::this_thread::sleep_for(std::chrono::seconds(1));
+                            std::string obj = yolo.getObjectName(CameraSource::OAKD, true);
+                            if (!obj.empty()) {
+                                scene_object_name = obj;
+                                RCLCPP_INFO(node->get_logger(), "[%lus] Spin extra pic %d: detected '%s'!",
+                                            secondsElapsed, extra, obj.c_str());
+                                if (!have_obj_detect_pose) {
+                                    obj_detect_x = robotPose.x;
+                                    obj_detect_y = robotPose.y;
+                                    obj_detect_phi = robotPose.phi;
+                                    have_obj_detect_pose = true;
+                                }
+                                break;
+                            } else {
+                                RCLCPP_WARN(node->get_logger(), "[%lus] Spin extra pic %d: still no object.",
+                                            secondsElapsed, extra);
+                            }
+                        }
+                    }
+
+                    // If object found THIS step but no tag, take extra tag readings
+                    // (tag & object are on the same face, so tag should be visible NOW)
+                    if (best_tag_id < 0 && object_found_step == spin_step) {
+                        RCLCPP_INFO(node->get_logger(),
+                            "[%lus] Object found but no tag at step %d. Taking %d extra tag readings...",
+                            secondsElapsed, spin_step, 5);
+                        for (int retry = 1; retry <= 5; ++retry) {
+                            std::this_thread::sleep_for(std::chrono::milliseconds(800));
+                            auto retry_tags = tag_detector->getVisibleTags(Config::CANDIDATE_TAG_IDS);
+                            for (int tid : retry_tags) {
+                                auto tp_opt = tag_detector->getTagPose(tid);
+                                if (tp_opt.has_value()) {
+                                    auto& tp = tp_opt.value();
+                                    float dist = std::sqrt(tp.position.x * tp.position.x +
+                                                           tp.position.y * tp.position.y);
+                                    float angle = std::atan2(tp.position.y, tp.position.x);
+                                    RCLCPP_INFO(node->get_logger(),
+                                        "[%lus] [AprilTag] retry %d: ID=%d | dist=%.3fm | angle=%.1fdeg",
+                                        secondsElapsed, retry, tid, dist, angle * 180.0 / M_PI);
+                                    detected_apriltags.push_back({current_box_index, tid, dist,
+                                        angle * 180.0f / (float)M_PI,
+                                        (float)tp.position.x, (float)tp.position.y, (float)tp.position.z});
+                                    if (best_tag_id < 0) {
+                                        best_tag_id = tid;
+                                        best_tag_dist = dist;
+                                        best_tag_angle = angle;
+                                    }
+                                }
+                            }
+                            if (best_tag_id >= 0) break;
+                        }
+                    }
+                    
+                    // Early exit if both found
+                    if (!scene_object_name.empty() && best_tag_id >= 0) {
+                        RCLCPP_INFO(node->get_logger(),
+                            "[%lus] Both object and tag found at spin step %d. Done searching.",
+                            secondsElapsed, spin_step);
+                        break;
                     }
                 }
-                if (best_tag_id < 0) {
+            }
+            
+            // If EITHER is still missing, decide whether to skip or attempt a no-tag drop
+            if (scene_object_name.empty() || best_tag_id < 0) {
+                // Special case: object found, matches manipulatable, carrying it, no tag.
+                // Fall through to MATCH FOUND for no-tag drop instead of skipping.
+                bool attempt_no_tag_drop = false;
+                if (!scene_object_name.empty() && best_tag_id < 0 &&
+                    manipulable_picked && !object_placed && !manipulable_object_name.empty() &&
+                    scene_object_name == manipulable_object_name &&
+                    !no_arm_mode && arm) {
+                    attempt_no_tag_drop = true;
                     RCLCPP_WARN(node->get_logger(),
-                        "[%lus] No AprilTag found after full 360° spin at box %d.",
-                        secondsElapsed, current_box_index);
+                        "[%lus] Object '%s' matches manipulatable but NO AprilTag. Will attempt no-tag drop.",
+                        secondsElapsed, scene_object_name.c_str());
+                }
+
+                if (!attempt_no_tag_drop) {
+                    RCLCPP_WARN(node->get_logger(),
+                        "[%lus] Skipping box %d: object=%s, tag=%s. Moving to next.",
+                        secondsElapsed, current_box_index,
+                        scene_object_name.empty() ? "NONE" : scene_object_name.c_str(),
+                        best_tag_id >= 0 ? ("ID=" + std::to_string(best_tag_id)).c_str() : "NONE");
+                    if (!scene_object_name.empty()) {
+                        detected_scene_objects.push_back({scene_object_name, yolo.getConfidence(),
+                            x, y, phi, (float)robotPose.x, (float)robotPose.y, (float)robotPose.phi});
+                    }
+                    continue;
                 }
             }
+            
+            RCLCPP_INFO(node->get_logger(), "[%lus] Detected scene object: '%s' (conf=%.2f) and AprilTag ID=%d at box %d",
+                        secondsElapsed, scene_object_name.c_str(), yolo.getConfidence(), best_tag_id, current_box_index);
+            detected_scene_objects.push_back({scene_object_name, yolo.getConfidence(),
+                x, y, phi, (float)robotPose.x, (float)robotPose.y, (float)robotPose.phi});
             
             // In no-arm mode, log everything and move on
             if (no_arm_mode || !arm) {
@@ -1386,45 +1534,223 @@ int main(int argc, char** argv) {
                         scene_object_name.c_str(), manipulable_object_name.c_str());
             
             // AprilTag was already searched during spin-and-detect above.
-            // Use whatever was found — no need to spin again.
+            // If no tag, use the robot's heading when the object was detected as fallback.
             if (best_tag_id < 0) {
-                RCLCPP_WARN(node->get_logger(), "[%lus] No AprilTag was found at this box. Cannot align for drop.", secondsElapsed);
+                RCLCPP_WARN(node->get_logger(),
+                    "[%lus] No AprilTag found — using object-detection heading for drop.",
+                    secondsElapsed);
+
+                if (have_obj_detect_pose) {
+                    // Rotate to the ABSOLUTE heading where we saw the object.
+                    // Use moveToGoal (not nav.spin) because robotPose.phi from
+                    // AMCL can be stale after multiple spin steps, causing a
+                    // relative rotation to overshoot/undershoot.  moveToGoal
+                    // uses the controller's own TF lookups for accurate heading.
+                    RCLCPP_INFO(node->get_logger(),
+                        "[%lus] No-tag drop: Rotating to object-detection heading (%.1fdeg) via moveToGoal",
+                        secondsElapsed, obj_detect_phi * 180.0 / M_PI);
+                    nav.moveToGoal(robotPose.x, robotPose.y, obj_detect_phi, 10.0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                } else {
+                    RCLCPP_WARN(node->get_logger(),
+                        "[%lus] No saved detection pose — dropping from current heading.",
+                        secondsElapsed);
+                }
+
+                // No forward drive — drop directly from current position
+                // (no AprilTag means we can't judge distance to bin accurately)
+
+                // === DROP SEQUENCE (no-tag fallback) ===
+                RCLCPP_INFO(node->get_logger(), "[%lus] === NO-TAG DROP: DROPPING OBJECT ===" , secondsElapsed);
+
+                RCLCPP_INFO(node->get_logger(), "[%lus] Moving arm to DROP pose...", secondsElapsed);
+                bool drop_ok = moveArmPose(arm.get(), node->get_logger(),
+                                        Config::ARM_DROP_JOINTS,
+                                        Config::ARM_DROP_X, Config::ARM_DROP_Y, Config::ARM_DROP_Z,
+                                        Config::ARM_DROP_QX, Config::ARM_DROP_QY, Config::ARM_DROP_QZ, Config::ARM_DROP_QW);
+                if (!drop_ok) {
+                    RCLCPP_WARN(node->get_logger(), "[%lus] DROP pose failed! Opening gripper from current position.", secondsElapsed);
+                }
+
+                RCLCPP_INFO(node->get_logger(), "[%lus] Opening gripper to release object...", secondsElapsed);
+                arm->openGripper();
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+
+                RCLCPP_INFO(node->get_logger(), "[%lus] Returning arm to CARRY pose...", secondsElapsed);
+                moveArmPose(arm.get(), node->get_logger(),
+                                        Config::ARM_CARRY_JOINTS,
+                                        Config::ARM_CARRY_X, Config::ARM_CARRY_Y, Config::ARM_CARRY_Z,
+                                        Config::ARM_CARRY_QX, Config::ARM_CARRY_QY, Config::ARM_CARRY_QZ, Config::ARM_CARRY_QW);
+
+                RCLCPP_INFO(node->get_logger(), "[%lus] *** Object placed (no-tag fallback)! ***", secondsElapsed);
+                object_placed = true;
                 continue;
             }
             
-            RCLCPP_INFO(node->get_logger(), "[%lus] Using AprilTag ID=%d (dist=%.3fm, angle=%.1fdeg) for bin alignment.",
-                        secondsElapsed, best_tag_id, best_tag_dist, best_tag_angle * 180.0 / M_PI);
-            
-            // Re-read tag pose (robot may have rotated during spin, need fresh data)
-            auto fresh_tag = tag_detector->getTagPose(best_tag_id);
-            if (fresh_tag.has_value()) {
-                best_tag_dist = std::sqrt(fresh_tag->position.x * fresh_tag->position.x +
-                                          fresh_tag->position.y * fresh_tag->position.y);
-                best_tag_angle = std::atan2(fresh_tag->position.y, fresh_tag->position.x);
-                RCLCPP_INFO(node->get_logger(), "[%lus] Fresh tag pose: dist=%.3fm, angle=%.1fdeg",
-                            secondsElapsed, best_tag_dist, best_tag_angle * 180.0 / M_PI);
+            // === MAP-FRAME BIN ALIGNMENT ===
+            // One-shot: read tag in base_link frame, convert to MAP frame using
+            // current robot pose, then Phase A (rotate to face bin) + Phase B
+            // (drive to drop distance).  Tag is only read once; all subsequent
+            // motion uses absolute map coordinates so stale angles can't cause
+            // the robot to drive away from the bin.
+            float bin_map_x = 0.0f, bin_map_y = 0.0f;
+            bool have_bin_position = false;
+
+            // Try a fresh tag reading first (tag may still be in view)
+            auto alignment_tag = tag_detector->getTagPose(best_tag_id);
+            if (alignment_tag.has_value()) {
+                float tag_x = alignment_tag->position.x;   // forward in base_link
+                float tag_y = alignment_tag->position.y;   // left in base_link
+                float tag_dist = std::sqrt(tag_x * tag_x + tag_y * tag_y);
+                float tag_angle = std::atan2(tag_y, tag_x);
+                bin_map_x = robotPose.x + tag_dist * std::cos(robotPose.phi + tag_angle);
+                bin_map_y = robotPose.y + tag_dist * std::sin(robotPose.phi + tag_angle);
+                have_bin_position = true;
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] Fresh tag %d: dist=%.3f angle=%.1fdeg → Bin MAP (%.3f, %.3f)",
+                    secondsElapsed, best_tag_id, tag_dist, tag_angle * 180.0 / M_PI,
+                    bin_map_x, bin_map_y);
             } else {
-                RCLCPP_WARN(node->get_logger(), "[%lus] Tag pose expired since spin. Using last known values.", secondsElapsed);
+                // Tag not currently visible — spin slowly to re-acquire it
+                RCLCPP_WARN(node->get_logger(),
+                    "[%lus] Tag %d not visible. Spinning to re-acquire...",
+                    secondsElapsed, best_tag_id);
+                for (int search = 0; search < 6; ++search) {
+                    nav.spin(M_PI / 6.0, 8.0);   // 30° per step, up to 180°
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                    auto retry = tag_detector->getTagPose(best_tag_id);
+                    if (retry.has_value()) {
+                        float tx = retry->position.x;
+                        float ty = retry->position.y;
+                        float td = std::sqrt(tx * tx + ty * ty);
+                        float ta = std::atan2(ty, tx);
+                        bin_map_x = robotPose.x + td * std::cos(robotPose.phi + ta);
+                        bin_map_y = robotPose.y + td * std::sin(robotPose.phi + ta);
+                        have_bin_position = true;
+                        RCLCPP_INFO(node->get_logger(),
+                            "[%lus] Re-acquired tag %d at step %d → Bin MAP (%.3f, %.3f)",
+                            secondsElapsed, best_tag_id, search + 1,
+                            bin_map_x, bin_map_y);
+                        break;
+                    }
+                }
             }
-            
-            // Use tag pose to align the robot precisely
-            if (std::abs(best_tag_dist - Config::DESIRED_DROP_DISTANCE) > Config::DISTANCE_TOLERANCE ||
-                std::abs(best_tag_angle) > Config::ANGLE_TOLERANCE) {
-                
-                float move_dist = best_tag_dist - Config::DESIRED_DROP_DISTANCE;
-                float new_x = robotPose.x + move_dist * std::cos(robotPose.phi + best_tag_angle);
-                float new_y = robotPose.y + move_dist * std::sin(robotPose.phi + best_tag_angle);
-                float new_phi = robotPose.phi + best_tag_angle;
-                while (new_phi > M_PI) new_phi -= 2.0 * M_PI;
-                while (new_phi < -M_PI) new_phi += 2.0 * M_PI;
-                
-                RCLCPP_INFO(node->get_logger(), "[%lus] Adjusting to: x=%.2f, y=%.2f, phi=%.2f",
-                            secondsElapsed, new_x, new_y, new_phi);
-                nav.moveToGoal(new_x, new_y, new_phi);
+
+            if (!have_bin_position) {
+                RCLCPP_WARN(node->get_logger(),
+                    "[%lus] Could not acquire tag %d. Dropping from current position.",
+                    secondsElapsed, best_tag_id);
             } else {
-                RCLCPP_INFO(node->get_logger(), "[%lus] Already aligned. No adjustment needed.", secondsElapsed);
+                // Compute alignment in MAP frame
+                float dx_bin = bin_map_x - robotPose.x;
+                float dy_bin = bin_map_y - robotPose.y;
+                float dist_to_bin = std::sqrt(dx_bin * dx_bin + dy_bin * dy_bin);
+                float angle_to_bin = std::atan2(dy_bin, dx_bin);  // absolute MAP heading
+                float angle_error = angle_to_bin - robotPose.phi;
+                while (angle_error > M_PI) angle_error -= 2.0 * M_PI;
+                while (angle_error < -M_PI) angle_error += 2.0 * M_PI;
+
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] Bin: %.3fm away, heading=%.1fdeg, error=%.1fdeg",
+                    secondsElapsed, dist_to_bin, angle_to_bin * 180.0 / M_PI,
+                    angle_error * 180.0 / M_PI);
+
+                // Phase A: Rotate in place to face the bin
+                if (std::abs(angle_error) > 0.05) {   // ~3° threshold
+                    RCLCPP_INFO(node->get_logger(),
+                        "[%lus] Phase A: Rotating %.1fdeg to face bin",
+                        secondsElapsed, angle_error * 180.0 / M_PI);
+                    nav.spin(angle_error, 10.0);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                }
+
+                // Phase B: Drive forward/backward to drop distance
+                // Recompute from updated pose after rotation
+                float dx2 = bin_map_x - robotPose.x;
+                float dy2 = bin_map_y - robotPose.y;
+                float dist2 = std::sqrt(dx2 * dx2 + dy2 * dy2);
+                float angle2 = std::atan2(dy2, dx2);
+                float drive_dist = dist2 - Config::DESIRED_DROP_DISTANCE;
+
+                // Temporarily tighten Nav2 goal tolerance so small moves
+                // (5-15cm) aren't swallowed by the normal tolerance.
+                bool tolerance_tightened = false;
+                if (std::abs(drive_dist) > 0.03) {
+                    try {
+                        auto tol_client = std::make_shared<rclcpp::SyncParametersClient>(
+                            node, "/controller_server");
+                        if (tol_client->wait_for_service(std::chrono::seconds(2))) {
+                            tol_client->set_parameters({
+                                rclcpp::Parameter("general_goal_checker.xy_goal_tolerance", Config::ALIGNMENT_XY_TOLERANCE)
+                            });
+                            tolerance_tightened = true;
+                            RCLCPP_INFO(node->get_logger(),
+                                "[%lus] Tightened goal tolerance to %.2fm for alignment",
+                                secondsElapsed, Config::ALIGNMENT_XY_TOLERANCE);
+                        }
+                    } catch (const std::exception& e) {
+                        RCLCPP_WARN(node->get_logger(),
+                            "[%lus] Could not tighten tolerance: %s", secondsElapsed, e.what());
+                    }
+                }
+
+                if (drive_dist > 0.03) {
+                    float gx = robotPose.x + drive_dist * std::cos(angle2);
+                    float gy = robotPose.y + drive_dist * std::sin(angle2);
+                    float gyaw = angle2;
+                    while (gyaw > M_PI) gyaw -= 2.0 * M_PI;
+                    while (gyaw < -M_PI) gyaw += 2.0 * M_PI;
+                    RCLCPP_INFO(node->get_logger(),
+                        "[%lus] Phase B: Drive %.3fm → goal MAP (%.3f, %.3f, %.1fdeg)",
+                        secondsElapsed, drive_dist, gx, gy, gyaw * 180.0 / M_PI);
+                    nav.moveToGoal(gx, gy, gyaw, 15.0);
+                } else if (drive_dist < -0.03) {
+                    float backup = -drive_dist;
+                    float gx = robotPose.x - backup * std::cos(angle2);
+                    float gy = robotPose.y - backup * std::sin(angle2);
+                    float gyaw = angle2;
+                    while (gyaw > M_PI) gyaw -= 2.0 * M_PI;
+                    while (gyaw < -M_PI) gyaw += 2.0 * M_PI;
+                    RCLCPP_WARN(node->get_logger(),
+                        "[%lus] Phase B: Too close (%.3fm past). Backing up %.3fm → MAP (%.3f, %.3f)",
+                        secondsElapsed, backup, backup, gx, gy);
+                    nav.moveToGoal(gx, gy, gyaw, 15.0);
+                } else {
+                    RCLCPP_INFO(node->get_logger(),
+                        "[%lus] At drop distance (%.3fm). No drive needed.",
+                        secondsElapsed, dist2);
+                }
+
+                // Restore normal goal tolerance for subsequent navigation
+                if (tolerance_tightened) {
+                    try {
+                        auto tol_client = std::make_shared<rclcpp::SyncParametersClient>(
+                            node, "/controller_server");
+                        if (tol_client->wait_for_service(std::chrono::seconds(2))) {
+                            tol_client->set_parameters({
+                                rclcpp::Parameter("general_goal_checker.xy_goal_tolerance", 0.25)
+                            });
+                            RCLCPP_INFO(node->get_logger(),
+                                "[%lus] Restored goal tolerance to 0.25m",
+                                secondsElapsed);
+                        }
+                    } catch (const std::exception& e) {
+                        RCLCPP_WARN(node->get_logger(),
+                            "[%lus] Could not restore tolerance: %s", secondsElapsed, e.what());
+                    }
+                }
             }
-            
+
+            // Phase C: Final fixed forward drive toward the bin before dropping
+            {
+                float fwd_x = robotPose.x + Config::FORWARD_DRIVE_BEFORE_DROP * std::cos(robotPose.phi);
+                float fwd_y = robotPose.y + Config::FORWARD_DRIVE_BEFORE_DROP * std::sin(robotPose.phi);
+                RCLCPP_INFO(node->get_logger(),
+                    "[%lus] Phase C: Final forward drive %.2fm → MAP (%.3f, %.3f)",
+                    secondsElapsed, Config::FORWARD_DRIVE_BEFORE_DROP, fwd_x, fwd_y);
+                nav.moveToGoal(fwd_x, fwd_y, robotPose.phi, 15.0);
+            }
+
             // === DROP SEQUENCE ===
             RCLCPP_INFO(node->get_logger(), "[%lus] === DROPPING OBJECT INTO BIN ===", secondsElapsed);
             
@@ -1499,15 +1825,31 @@ int main(int argc, char** argv) {
     if (outfile.is_open()) {
         outfile << "=== CONTEST 2 RESULTS ===\n";
         outfile << "Mode: " << (no_arm_mode ? "NAV-ONLY (no arm)" : "FULL (with arm)") << "\n";
-        outfile << "Manipulable Object: " << (no_arm_mode ? "N/A (no-arm mode)" : (manipulable_object_name.empty() ? "NOT DETECTED" : manipulable_object_name)) << "\n";
+        outfile << "Manipulable Object: " << (no_arm_mode ? "N/A (no-arm mode)" : (manipulable_object_name.empty() ? "NOT DETECTED" : manipulable_object_name));
+        if (!no_arm_mode && !manipulable_object_name.empty()) {
+            if (manipulable_confidence >= 0.0f) {
+                outfile << " (confidence: " << std::fixed << std::setprecision(2) << manipulable_confidence << ")";
+            } else {
+                outfile << " (confidence: N/A - defaulted)";
+            }
+        }
+        outfile << "\n";
         outfile << "Object Placed: " << (no_arm_mode ? "N/A" : (object_placed ? "YES" : "NO")) << "\n";
         outfile << "Boxes Visited: " << boxes_visited << "/" << boxes.coords.size() << "\n";
         outfile << "\nDetected Scene Objects:\n";
         for (size_t i = 0; i < detected_scene_objects.size(); ++i) {
-            outfile << "  " << (i + 1) << ". Object: " << detected_scene_objects[i].first
-                    << " at (x=" << detected_scene_objects[i].second[0]
-                    << ", y=" << detected_scene_objects[i].second[1]
-                    << ", phi=" << detected_scene_objects[i].second[2] << ")\n";
+            auto& det = detected_scene_objects[i];
+            outfile << "  " << (i + 1) << ". Object: " << det.name;
+            if (det.confidence >= 0.0f) {
+                outfile << " (confidence: " << std::fixed << std::setprecision(2) << det.confidence << ")";
+            } else {
+                outfile << " (confidence: N/A)";
+            }
+            outfile << "\n";
+            outfile << "     Predefined coords: (x=" << std::defaultfloat << det.box_x
+                    << ", y=" << det.box_y << ", phi=" << det.box_phi << ")\n";
+            outfile << "     Robot pose at detection: (x=" << det.robot_x
+                    << ", y=" << det.robot_y << ", phi=" << det.robot_phi << ")\n";
         }
         if (!detected_apriltags.empty()) {
             outfile << "\nAprilTag Detections:\n";

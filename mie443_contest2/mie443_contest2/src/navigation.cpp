@@ -6,6 +6,24 @@
 using NavigateToPose = nav2_msgs::action::NavigateToPose;
 using GoalHandleNavigateToPose = rclcpp_action::ClientGoalHandle<NavigateToPose>;
 
+// =============================================================================
+// Nav2 Tuning Parameters — edit these to tune navigation behavior
+// =============================================================================
+namespace NavParams {
+    double XY_GOAL_TOLERANCE      = 0.25;   // meters — how close robot must be to goal
+    double YAW_GOAL_TOLERANCE     = 0.15;   // radians — heading accuracy at goal
+    double INFLATION_RADIUS       = 0.18;   // meters — obstacle inflation in costmaps
+    double COST_SCALING_FACTOR    = 4.0;    // how steeply cost drops from obstacles
+    double PROGRESS_RADIUS        = 0.10;   // meters — min movement to avoid "stuck"
+    double PROGRESS_TIME          = 30.0;   // seconds — time window for progress check
+    double TF_TOLERANCE           = 2.0;    // seconds — transform staleness tolerance
+    double FOLLOW_PATH_TF_TOL    = 2.0;    // seconds — FollowPath transform tolerance
+    double COLLISION_TIME_BEFORE  = 0.3;    // seconds — stop-before-collision threshold
+    double COLLISION_SIM_STEP     = 0.01;   // seconds — collision simulation time step
+    double COLLISION_SOURCE_TIMEOUT = 0.0;   // seconds — 0 disables staleness check (DDS drops cause growing drift)
+    double COLLISION_STOP_PUB_TIMEOUT = 2.0; // seconds — how long stop cmd persists after source goes invalid
+}
+
 Navigation::Navigation(std::shared_ptr<rclcpp::Node> node) : node_(node) {
 	// Set up action client for Nav2
 	action_client_ = rclcpp_action::create_client<NavigateToPose>(node_, "navigate_to_pose");
@@ -28,6 +46,16 @@ Navigation::Navigation(std::shared_ptr<rclcpp::Node> node) : node_(node) {
 			"In-place rotation will fall back to moveToGoal.");
 	} else {
 		RCLCPP_INFO(node_->get_logger(), "Spin action client initialized");
+	}
+
+	// Set up BackUp action client (part of Nav2 behavior server)
+	backup_client_ = rclcpp_action::create_client<nav2_msgs::action::BackUp>(node_, "backup");
+	if (!backup_client_->wait_for_action_server(std::chrono::seconds(5))) {
+		RCLCPP_WARN(node_->get_logger(),
+			"BackUp action server not available after 5s. "
+			"Backup recovery will not work.");
+	} else {
+		RCLCPP_INFO(node_->get_logger(), "BackUp action client initialized");
 	}
 }
 
@@ -222,6 +250,59 @@ bool Navigation::spin(double angle_rad, double timeout_sec) {
 	return false;
 }
 
+bool Navigation::backup(double distance_m, double speed, double timeout_sec) {
+	if (!backup_client_ || !backup_client_->action_server_is_ready()) {
+		RCLCPP_WARN(node_->get_logger(),
+			"BackUp action server not ready. Cannot back up %.2fm.", distance_m);
+		return false;
+	}
+
+	RCLCPP_INFO(node_->get_logger(), "Backing up %.2fm at %.2f m/s...",
+		distance_m, speed);
+
+	auto goal_msg = nav2_msgs::action::BackUp::Goal();
+	goal_msg.target.x = -distance_m;  // negative X = backward in base_link
+	goal_msg.target.y = 0.0;
+	goal_msg.target.z = 0.0;
+	goal_msg.speed = static_cast<float>(speed);
+	goal_msg.time_allowance.sec = static_cast<int32_t>(timeout_sec);
+	goal_msg.time_allowance.nanosec = 0;
+
+	auto send_goal_options = rclcpp_action::Client<nav2_msgs::action::BackUp>::SendGoalOptions();
+
+	auto goal_handle_future = backup_client_->async_send_goal(goal_msg, send_goal_options);
+
+	if (goal_handle_future.wait_for(std::chrono::seconds(5)) != std::future_status::ready) {
+		RCLCPP_ERROR(node_->get_logger(), "BackUp goal acceptance timeout (5s).");
+		return false;
+	}
+
+	auto goal_handle = goal_handle_future.get();
+	if (!goal_handle) {
+		RCLCPP_ERROR(node_->get_logger(), "BackUp goal was rejected by Nav2.");
+		return false;
+	}
+
+	auto result_future = backup_client_->async_get_result(goal_handle);
+	auto wait_duration = std::chrono::seconds(static_cast<int>(timeout_sec) + 5);
+
+	if (result_future.wait_for(wait_duration) != std::future_status::ready) {
+		RCLCPP_ERROR(node_->get_logger(), "BackUp timeout (%.0fs). Cancelling.", timeout_sec);
+		backup_client_->async_cancel_goal(goal_handle);
+		return false;
+	}
+
+	auto result = result_future.get();
+	if (result.code == rclcpp_action::ResultCode::SUCCEEDED) {
+		RCLCPP_INFO(node_->get_logger(), "BackUp completed successfully.");
+		return true;
+	}
+
+	RCLCPP_WARN(node_->get_logger(), "BackUp finished with code %d (error: %u, msg: '%s').",
+		(int)result.code, result.result->error_code, result.result->error_msg.c_str());
+	return false;
+}
+
 bool Navigation::waitUntilReady(double timeout_sec) {
 	RCLCPP_INFO(node_->get_logger(),
 		"Waiting up to %.0fs for Nav2 global costmap to be ready...", timeout_sec);
@@ -281,14 +362,17 @@ bool Navigation::waitUntilReady(double timeout_sec) {
 				node_, "/controller_server");
 			if (param_client->wait_for_service(std::chrono::seconds(5))) {
 				param_client->set_parameters({
-					rclcpp::Parameter("progress_checker.required_movement_radius", 0.10),
-					rclcpp::Parameter("progress_checker.movement_time_allowance", 30.0),
-					rclcpp::Parameter("general_goal_checker.xy_goal_tolerance", 0.08),
-					rclcpp::Parameter("general_goal_checker.yaw_goal_tolerance", 0.20),
-					rclcpp::Parameter("FollowPath.transform_tolerance", 2.0)
+					rclcpp::Parameter("progress_checker.required_movement_radius", NavParams::PROGRESS_RADIUS),
+					rclcpp::Parameter("progress_checker.movement_time_allowance", NavParams::PROGRESS_TIME),
+					rclcpp::Parameter("general_goal_checker.xy_goal_tolerance", NavParams::XY_GOAL_TOLERANCE),
+					rclcpp::Parameter("general_goal_checker.yaw_goal_tolerance", NavParams::YAW_GOAL_TOLERANCE),
+					rclcpp::Parameter("FollowPath.transform_tolerance", NavParams::FOLLOW_PATH_TF_TOL)
 				});
 				RCLCPP_INFO(node_->get_logger(),
-					"Nav2 tuned: progress=0.10m/30s, goal=0.15m/0.25rad, TF=2.0s");
+					"Nav2 tuned: progress=%.2fm/%.0fs, goal=%.2fm/%.2frad, TF=%.1fs",
+					NavParams::PROGRESS_RADIUS, NavParams::PROGRESS_TIME,
+					NavParams::XY_GOAL_TOLERANCE, NavParams::YAW_GOAL_TOLERANCE,
+					NavParams::FOLLOW_PATH_TF_TOL);
 			} else {
 				RCLCPP_WARN(node_->get_logger(),
 					"Could not reach /controller_server to set params.");
@@ -304,9 +388,13 @@ bool Navigation::waitUntilReady(double timeout_sec) {
 				node_, "/local_costmap/local_costmap");
 			if (local_client->wait_for_service(std::chrono::seconds(3))) {
 				local_client->set_parameters({
-					rclcpp::Parameter("transform_tolerance", 2.0)
+					rclcpp::Parameter("transform_tolerance", NavParams::TF_TOLERANCE),
+					rclcpp::Parameter("inflation_layer.inflation_radius", NavParams::INFLATION_RADIUS),
+					rclcpp::Parameter("inflation_layer.cost_scaling_factor", NavParams::COST_SCALING_FACTOR)
 				});
-				RCLCPP_INFO(node_->get_logger(), "Local costmap: TF tol=2.0s");
+				RCLCPP_INFO(node_->get_logger(),
+					"Local costmap: TF tol=%.1fs, inflation=%.2fm, cost_scaling=%.1f",
+					NavParams::TF_TOLERANCE, NavParams::INFLATION_RADIUS, NavParams::COST_SCALING_FACTOR);
 			}
 		} catch (const std::exception& e) {
 			RCLCPP_WARN(node_->get_logger(),
@@ -319,9 +407,13 @@ bool Navigation::waitUntilReady(double timeout_sec) {
 				node_, "/global_costmap/global_costmap");
 			if (global_client->wait_for_service(std::chrono::seconds(3))) {
 				global_client->set_parameters({
-					rclcpp::Parameter("transform_tolerance", 2.0)
+					rclcpp::Parameter("transform_tolerance", NavParams::TF_TOLERANCE),
+					rclcpp::Parameter("inflation_layer.inflation_radius", NavParams::INFLATION_RADIUS),
+					rclcpp::Parameter("inflation_layer.cost_scaling_factor", NavParams::COST_SCALING_FACTOR)
 				});
-				RCLCPP_INFO(node_->get_logger(), "Global costmap: TF tol=2.0s");
+				RCLCPP_INFO(node_->get_logger(),
+					"Global costmap: TF tol=%.1fs, inflation=%.2fm, cost_scaling=%.1f",
+					NavParams::TF_TOLERANCE, NavParams::INFLATION_RADIUS, NavParams::COST_SCALING_FACTOR);
 			}
 		} catch (const std::exception& e) {
 			RCLCPP_WARN(node_->get_logger(),
@@ -329,14 +421,23 @@ bool Navigation::waitUntilReady(double timeout_sec) {
 		}
 
 		// --- Collision monitor ---
+		// Reduce approach threshold so robot can get close to bins for AprilTag
+		// detection and object drop. Default 1.2s blocks robot at ~0.21m.
 		try {
 			auto cm_client = std::make_shared<rclcpp::SyncParametersClient>(
 				node_, "/collision_monitor");
 			if (cm_client->wait_for_service(std::chrono::seconds(3))) {
 				cm_client->set_parameters({
-					rclcpp::Parameter("transform_tolerance", 2.0)
+					rclcpp::Parameter("transform_tolerance", NavParams::TF_TOLERANCE),
+					rclcpp::Parameter("source_timeout", NavParams::COLLISION_SOURCE_TIMEOUT),
+					rclcpp::Parameter("stop_pub_timeout", NavParams::COLLISION_STOP_PUB_TIMEOUT),
+					rclcpp::Parameter("FootprintApproach.time_before_collision", NavParams::COLLISION_TIME_BEFORE),
+					rclcpp::Parameter("FootprintApproach.simulation_time_step", NavParams::COLLISION_SIM_STEP)
 				});
-				RCLCPP_INFO(node_->get_logger(), "Collision monitor: TF tol=2.0s");
+				RCLCPP_INFO(node_->get_logger(),
+					"Collision monitor: TF=%.1fs, src_timeout=%.1fs, stop_pub=%.1fs, approach=%.1fs",
+					NavParams::TF_TOLERANCE, NavParams::COLLISION_SOURCE_TIMEOUT,
+					NavParams::COLLISION_STOP_PUB_TIMEOUT, NavParams::COLLISION_TIME_BEFORE);
 			}
 		} catch (const std::exception& e) {
 			RCLCPP_WARN(node_->get_logger(),
